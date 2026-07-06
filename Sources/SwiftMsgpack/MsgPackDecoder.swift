@@ -55,7 +55,7 @@ open class MsgPackDecoder {
         try data.withUnsafeBytes {
             let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
             let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value)
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data)
             do {
                 return try decoder.unwrap(as: T.self)
             } catch {
@@ -72,7 +72,7 @@ open class MsgPackDecoder {
         try data.withUnsafeBytes {
             let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
             let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value)
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data)
             do {
                 return try decoder.unwrap(as: T.self, configuration: configuration)
             } catch {
@@ -97,14 +97,16 @@ public protocol MsgPackDecodable: Decodable {
 
 public typealias MsgPackCodable = MsgPackDecodable & MsgPackEncodable
 
-private class _MsgPackDecoder: Decoder {
+class _MsgPackDecoder: Decoder {
     var codingPath: [CodingKey]
     var value: MsgPackValue
     let rawData: Data?
+    let sourceData: Data
     var userInfo: [CodingUserInfoKey: Any] = [:]
 
-    init(from value: MsgPackValue, at codingPath: [CodingKey] = []) {
-        rawData = value.rawData
+    init(from value: MsgPackValue, sourceData: Data, at codingPath: [CodingKey] = []) {
+        self.sourceData = sourceData
+        rawData = value.rawData(from: sourceData)
         self.value = value.stripped
         self.codingPath = codingPath
     }
@@ -222,7 +224,9 @@ private extension _MsgPackDecoder {
         let value = value.stripped
         if case let .literal(vv) = value {
             switch vv {
-            case let .uint(v), let .int(v):
+            case let .uint(v):
+                return T(truncatingIfNeeded: v)
+            case let .int(v):
                 return T(truncatingIfNeeded: v)
             default:
                 break
@@ -585,7 +589,7 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     private mutating func decoderForNextElement<T>(ofType _: T.Type) throws -> _MsgPackDecoder {
         let value = try getNextValue(ofType: T.self)
         let newPath = codingPath + [MsgPackKey(index: currentIndex)]
-        return _MsgPackDecoder(from: value, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, at: newPath)
     }
 
     @inline(__always)
@@ -682,17 +686,26 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private var source: Source
 
     static func asDictionary(value msgPackValue: MsgPackValue, using decoder: _MsgPackDecoder) -> [String: MsgPackValue] {
-        var result = [String: MsgPackValue]()
-        let a = msgPackValue.asDictionary()
-        result.reserveCapacity(a.count)
-        for (keyvalue, value) in a {
-            guard let key = try? decoder.unbox(keyvalue, as: String.self) else {
-                continue
+        switch msgPackValue.stripped {
+        case let .array(flat), let .map(flat):
+            let n = flat.count / 2
+            var result = [String: MsgPackValue]()
+            result.reserveCapacity(n)
+            for i in 0 ..< n {
+                guard let key = try? decoder.unbox(flat[i * 2], as: String.self) else { continue }
+                result[key]._setIfNil(to: flat[i * 2 + 1])
             }
-            result[key]._setIfNil(to: value)
+            return result
+        default:
+            var result = [String: MsgPackValue]()
+            let a = msgPackValue.asDictionary()
+            result.reserveCapacity(a.count)
+            for (keyvalue, value) in a {
+                guard let key = try? decoder.unbox(keyvalue, as: String.self) else { continue }
+                result[key]._setIfNil(to: value)
+            }
+            return result
         }
-
-        return result
     }
 
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
@@ -821,7 +834,7 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private func decoderForKey<LocalKey: CodingKey>(_ key: LocalKey) throws -> _MsgPackDecoder {
         let value = try getValue(forKey: key)
         let newPath: [CodingKey] = codingPath + [key]
-        return _MsgPackDecoder(from: value, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, at: newPath)
     }
 
     @inline(__always)

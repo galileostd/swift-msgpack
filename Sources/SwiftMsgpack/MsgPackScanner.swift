@@ -3,8 +3,8 @@ import Foundation
 enum MsgPackValueLiteralType {
     case `nil`
     case bool(Bool)
-    case int(any FixedWidthInteger)
-    case uint(any FixedWidthInteger)
+    case int(Int64)
+    case uint(UInt64)
     case float32(Float)
     case float64(Double)
     case str(UnsafeBufferPointer<UInt8>)
@@ -18,10 +18,10 @@ extension MsgPackValueLiteralType {
             return "nil"
         case .bool:
             return "bool"
-        case let .int(v):
-            return "\(type(of: v))"
-        case let .uint(v):
-            return "\(type(of: v))"
+        case .int:
+            return "Int64"
+        case .uint:
+            return "UInt64"
         case .float32:
             return "float32"
         case .float64:
@@ -47,20 +47,21 @@ indirect enum MsgPackValue {
     case map([MsgPackValue])
     case lazyArray(LazyArrayCursor)
     case lazyMap(LazyMapCursor)
-    case raw(Data, MsgPackValue)
+    case raw(from: Int, count: Int, MsgPackValue)
 }
 
 extension MsgPackValue {
     var stripped: MsgPackValue {
-        if case let .raw(_, inner) = self {
+        if case let .raw(_, _, inner) = self {
             return inner.stripped
         }
         return self
     }
 
-    var rawData: Data? {
-        if case let .raw(d, _) = self {
-            return d
+    func rawData(from source: Data) -> Data? {
+        if case let .raw(from, count, _) = self {
+            let start = source.startIndex + from
+            return source.subdata(in: start ..< (start + count))
         }
         return nil
     }
@@ -69,7 +70,7 @@ extension MsgPackValue {
 extension MsgPackValue {
     func asArray() -> [MsgPackValue] {
         switch self {
-        case let .raw(_, inner):
+        case let .raw(_, _, inner):
             return inner.asArray()
         case .none:
             return []
@@ -86,7 +87,7 @@ extension MsgPackValue {
 
     func asDictionary() -> [(MsgPackValue, MsgPackValue)] {
         switch self {
-        case let .raw(_, inner):
+        case let .raw(_, _, inner):
             return inner.asDictionary()
         case .none, .literal, .ext:
             return []
@@ -141,7 +142,7 @@ extension MsgPackValue {
 extension MsgPackValue {
     var debugDataTypeDescription: String {
         switch self {
-        case let .raw(_, inner):
+        case let .raw(_, _, inner):
             return inner.debugDataTypeDescription
         case .none:
             return "none"
@@ -218,43 +219,55 @@ enum MsgPackOpCode {
     case neverUsed
     case end
 
+    private static let table: [MsgPackOpCode] = {
+        var t = [MsgPackOpCode](repeating: .neverUsed, count: 256)
+        for i in 0 ... 255 {
+            t[i] = MsgPackOpCode._build(UInt8(i))
+        }
+        return t
+    }()
+
     init(ch c: UInt8) {
+        self = MsgPackOpCode.table[Int(c)]
+    }
+
+    private static func _build(_ c: UInt8) -> MsgPackOpCode {
         if c <= 0xBF || c >= 0xE0 {
             if c & 0xE0 == 0xE0 {
-                self = .int(c)
+                return .int(c)
             } else if c & 0xA0 == 0xA0 {
-                self = .str(c - 0xA0)
+                return .str(c - 0xA0)
             } else if c & 0x90 == 0x90 {
-                self = .array(c - 0x90)
+                return .array(c - 0x90)
             } else if c & 0x80 == 0x80 {
-                self = .map(c - 0x80)
+                return .map(c - 0x80)
             } else if c & 0x80 == 0 {
-                self = .uint(c)
+                return .uint(c)
             } else {
-                self = .neverUsed
+                return .neverUsed
             }
         } else {
             switch c {
             case 0xC1:
-                self = .neverUsed
+                return .neverUsed
             case 0xC4 ... 0xC6:
-                self = .bin(c - 0x44)
+                return .bin(c - 0x44)
             case 0xDC, 0xDD:
-                self = .array(c - 0x5B)
+                return .array(c - 0x5B)
             case 0xDE, 0xDF:
-                self = .map(c - 0x5D)
+                return .map(c - 0x5D)
             case 0xC7 ... 0xC9:
-                self = .ext(c - 0x47)
+                return .ext(c - 0x47)
             case 0xCC ... 0xCF:
-                self = .uint(c - 0x4C)
+                return .uint(c - 0x4C)
             case 0xD0 ... 0xD3:
-                self = .int(c - 0x50)
+                return .int(c - 0x50)
             case 0xD9 ... 0xDB:
-                self = .str(c - 0x59)
+                return .str(c - 0x59)
             case 0xD4 ... 0xD8:
-                self = .ext(1 << (c - 0xD4))
+                return .ext(1 << (c - 0xD4))
             default:
-                self = .simple(c)
+                return .simple(c)
             }
         }
     }
@@ -271,10 +284,6 @@ class MsgPackScanner {
         start = ptr
         self.ptr = ptr
         self.count = count
-    }
-
-    private func slice(from begin: Int, to end: Int) -> Data {
-        source.subdata(in: (source.startIndex + begin) ..< (source.startIndex + end))
     }
 
     private func advanced(by n: Int) {
@@ -322,7 +331,7 @@ class MsgPackScanner {
         if end <= begin {
             return inner
         }
-        return .raw(slice(from: begin, to: end), inner)
+        return .raw(from: begin, count: end - begin, inner)
     }
 
     private func scanInner() -> MsgPackValue {
@@ -352,38 +361,37 @@ class MsgPackScanner {
         .literal(.uint(_scanUInt(c)))
     }
 
-    private func _scanUInt(_ c: UInt8) -> any FixedWidthInteger {
+    private func _scanUInt(_ c: UInt8) -> UInt64 {
         switch c {
         case 0x80:
-            readUInt8()
+            UInt64(readUInt8())
         case 0x81:
-            readUnaligned(as: UInt16.self).bigEndian
+            UInt64(readUnaligned(as: UInt16.self).bigEndian)
         case 0x82:
-            readUnaligned(as: UInt32.self).bigEndian
+            UInt64(readUnaligned(as: UInt32.self).bigEndian)
         case 0x83:
             readUnaligned(as: UInt64.self).bigEndian
         default:
-            c
+            UInt64(c)
         }
     }
 
     private func getLength(_ c: UInt8) -> Int {
-        let v = _scanUInt(c)
-        return Int(truncatingIfNeeded: v)
+        Int(truncatingIfNeeded: _scanUInt(c))
     }
 
     private func scanInt(_ c: UInt8) -> MsgPackValue {
         switch c {
         case 0x80:
-            .literal(.int(readInt8()))
+            .literal(.int(Int64(readInt8())))
         case 0x81:
-            .literal(.int(readUnaligned(as: Int16.self).bigEndian))
+            .literal(.int(Int64(readUnaligned(as: Int16.self).bigEndian)))
         case 0x82:
-            .literal(.int(readUnaligned(as: Int32.self).bigEndian))
+            .literal(.int(Int64(readUnaligned(as: Int32.self).bigEndian)))
         case 0x83:
             .literal(.int(readUnaligned(as: Int64.self).bigEndian))
         default:
-            .literal(.int(Int8(bitPattern: c)))
+            .literal(.int(Int64(Int8(bitPattern: c))))
         }
     }
 
@@ -460,7 +468,7 @@ extension MsgPackScanner {
         if end <= begin {
             return inner
         }
-        return .raw(slice(from: begin, to: end), inner)
+        return .raw(from: begin, count: end - begin, inner)
     }
 
     func scanLazyInner() -> MsgPackValue {
@@ -480,18 +488,24 @@ extension MsgPackScanner {
         case let .array(c):
             let n = getLength(c)
             let start = ptr
+            var positions: [UnsafeRawPointer] = []
+            positions.reserveCapacity(n)
             for _ in 0 ..< n {
+                positions.append(ptr)
                 skipOne()
             }
-            return .lazyArray(LazyArrayCursor(scanner: self, start: start, count: n))
+            return .lazyArray(LazyArrayCursor(scanner: self, start: start, count: n, positions: positions))
         case let .map(c):
             let n = getLength(c)
             let start = ptr
+            var positions: [UnsafeRawPointer] = []
+            positions.reserveCapacity(n)
             for _ in 0 ..< n {
+                positions.append(ptr)
                 skipOne()
                 skipOne()
             }
-            return .lazyMap(LazyMapCursor(scanner: self, start: start, pairCount: n))
+            return .lazyMap(LazyMapCursor(scanner: self, start: start, pairCount: n, positions: positions))
         case let .simple(c):
             return scanSimple(c)
         }

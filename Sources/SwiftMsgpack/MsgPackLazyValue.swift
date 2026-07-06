@@ -5,19 +5,16 @@ final class LazyArrayCursor {
     let start: UnsafeRawPointer
     let count: Int
 
+    private let positions: [UnsafeRawPointer]
     private var materialised: [MsgPackValue]
-    private var nextElement: UnsafeRawPointer
 
-    /// Number of elements that have been materialised so far. Exposed
-    /// so tests can assert lazy invariants (e.g. "only the first K
-    /// elements were walked").
     var consumedCount: Int { materialised.count }
 
-    init(scanner: MsgPackScanner, start: UnsafeRawPointer, count: Int) {
+    init(scanner: MsgPackScanner, start: UnsafeRawPointer, count: Int, positions: [UnsafeRawPointer]) {
         self.scanner = scanner
         self.start = start
         self.count = count
-        nextElement = start
+        self.positions = positions
         materialised = []
         materialised.reserveCapacity(count)
     }
@@ -25,18 +22,18 @@ final class LazyArrayCursor {
     func element(at index: Int) -> MsgPackValue {
         precondition(index >= 0 && index < count, "LazyArrayCursor element(at:) out of range \(index) vs count \(count)")
         while materialised.count <= index {
-            scanner.seek(to: nextElement)
+            let i = materialised.count
+            scanner.seek(to: positions[i])
             materialised.append(scanner.scanLazy())
-            nextElement = scanner.currentPointer
         }
         return materialised[index]
     }
 
     func elements() -> [MsgPackValue] {
         while materialised.count < count {
-            scanner.seek(to: nextElement)
+            let i = materialised.count
+            scanner.seek(to: positions[i])
             materialised.append(scanner.scanLazy())
-            nextElement = scanner.currentPointer
         }
         return materialised
     }
@@ -47,31 +44,28 @@ final class LazyMapCursor {
     let start: UnsafeRawPointer
     let pairCount: Int
 
+    private let pairPositions: [UnsafeRawPointer]
     private var pairs: [(MsgPackValue, MsgPackValue)]
     private var stringIndex: [String: Int]
-    /// Number of (key, value) pairs already walked. Exposed so tests
-    /// can assert lazy invariants (e.g. "only the first K pairs were
-    /// walked").
     private(set) var consumedPairs: Int
-    private var nextPair: UnsafeRawPointer
 
-    init(scanner: MsgPackScanner, start: UnsafeRawPointer, pairCount: Int) {
+    init(scanner: MsgPackScanner, start: UnsafeRawPointer, pairCount: Int, positions: [UnsafeRawPointer]) {
         self.scanner = scanner
         self.start = start
         self.pairCount = pairCount
+        pairPositions = positions
         pairs = []
         pairs.reserveCapacity(pairCount)
         stringIndex = [:]
         stringIndex.reserveCapacity(pairCount)
         consumedPairs = 0
-        nextPair = start
     }
 
     private func consumeNext() -> (MsgPackValue, MsgPackValue, String?) {
-        scanner.seek(to: nextPair)
+        let i = consumedPairs
+        scanner.seek(to: pairPositions[i])
         let k = scanner.scanLazy()
         let v = scanner.scanLazy()
-        nextPair = scanner.currentPointer
         consumedPairs += 1
         pairs.append((k, v))
         var keyString: String?
@@ -84,9 +78,6 @@ final class LazyMapCursor {
         return (k, v, keyString)
     }
 
-    /// Walk forward through the payload until the target string key is
-    /// found or the map is exhausted. Already-walked entries stay
-    /// cached so a second lookup is O(1).
     func value(forStringKey key: String) -> MsgPackValue? {
         if let idx = stringIndex[key] {
             return pairs[idx].1
@@ -100,8 +91,6 @@ final class LazyMapCursor {
         return nil
     }
 
-    /// All entries in encountered order, as a flat [k, v, k, v, ...]
-    /// array. Triggers a complete walk of the payload.
     func entries() -> [MsgPackValue] {
         while consumedPairs < pairCount {
             _ = consumeNext()
@@ -115,8 +104,6 @@ final class LazyMapCursor {
         return arr
     }
 
-    /// All string-typed keys discovered so far. Forces a complete walk
-    /// of the payload.
     func allStringKeys() -> [String] {
         while consumedPairs < pairCount {
             _ = consumeNext()

@@ -101,6 +101,10 @@ extension AnyCodable: Encodable {
 
 extension AnyCodable: Decodable {
     public init(from decoder: Decoder) throws {
+        if let mp = decoder as? _MsgPackDecoder {
+            self = try Self._fromMsgPackValue(mp.value)
+            return
+        }
         let container = try decoder.singleValueContainer()
         if container.decodeNil() {
             self.init(Self?.none)
@@ -140,6 +144,59 @@ extension AnyCodable: Decodable {
             return
         }
         throw DecodingError.dataCorruptedError(in: container, debugDescription: "AnyCodable value cannot be decoded")
+    }
+
+    private static func _fromMsgPackValue(_ value: MsgPackValue) throws -> AnyCodable {
+        switch value.stripped {
+        case .literal(.nil):
+            return AnyCodable(Self?.none)
+        case .literal(.bool(let v)):
+            return AnyCodable(v)
+        case .literal(.uint(let v)):
+            if v <= UInt64(Int.max) {
+                return AnyCodable(Int(v))
+            }
+            return AnyCodable(v)
+        case .literal(.int(let v)):
+            if v >= Int64(Int.min) {
+                return AnyCodable(Int(v))
+            }
+            return AnyCodable(v)
+        case .literal(.float32(let v)):
+            return AnyCodable(Double(v))
+        case .literal(.float64(let v)):
+            return AnyCodable(v)
+        case .literal(.str(let v)):
+            guard let s = String._tryFromUTF8(v) else {
+                throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "Invalid UTF-8 string"))
+            }
+            return AnyCodable(s)
+        case .literal(.bin(let v)):
+            return AnyCodable(v)
+        case .map, .lazyMap:
+            let dict = try _decodeDictionary(from: value)
+            return AnyCodable(dict)
+        case .array, .lazyArray:
+            let arr = try _decodeArray(from: value)
+            return AnyCodable(arr)
+        case .ext, .none, .raw:
+            throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "AnyCodable cannot decode extension or raw value"))
+        }
+    }
+
+    private static func _decodeDictionary(from value: MsgPackValue) throws -> [AnyCodable: AnyCodable] {
+        let pairs = value.asDictionary()
+        var dict = [AnyCodable: AnyCodable]()
+        dict.reserveCapacity(pairs.count)
+        for (k, v) in pairs {
+            dict[try _fromMsgPackValue(k)] = try _fromMsgPackValue(v)
+        }
+        return dict
+    }
+
+    private static func _decodeArray(from value: MsgPackValue) throws -> [AnyCodable] {
+        let elements = value.asArray()
+        return try elements.map { try _fromMsgPackValue($0) }
     }
 }
 
