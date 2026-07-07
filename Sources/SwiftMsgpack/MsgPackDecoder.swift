@@ -36,6 +36,8 @@ open class MsgPackDecoder {
 
     let options: DecodingOption
 
+    open var userInfo: [CodingUserInfoKey: Any] = [:]
+
     public init() {
         options = []
     }
@@ -52,10 +54,21 @@ open class MsgPackDecoder {
     }
 
     open func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try data.withUnsafeBytes {
-            let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
-            let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value)
+        try data.withUnsafeBytes { rawBuffer in
+            let value: MsgPackValue
+            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
+                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
+                value = scanRoot(scanner)
+                if scanner.corrupt {
+                    throw DecodingError.dataCorrupted(.init(
+                        codingPath: [],
+                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
+                    ))
+                }
+            } else {
+                value = .none
+            }
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
             do {
                 return try decoder.unwrap(as: T.self)
             } catch {
@@ -69,10 +82,21 @@ open class MsgPackDecoder {
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from data: Data, configuration: T.DecodingConfiguration) throws -> T {
-        try data.withUnsafeBytes {
-            let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
-            let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value)
+        try data.withUnsafeBytes { rawBuffer in
+            let value: MsgPackValue
+            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
+                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
+                value = scanRoot(scanner)
+                if scanner.corrupt {
+                    throw DecodingError.dataCorrupted(.init(
+                        codingPath: [],
+                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
+                    ))
+                }
+            } else {
+                value = .none
+            }
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
             do {
                 return try decoder.unwrap(as: T.self, configuration: configuration)
             } catch {
@@ -97,14 +121,21 @@ public protocol MsgPackDecodable: Decodable {
 
 public typealias MsgPackCodable = MsgPackDecodable & MsgPackEncodable
 
-private class _MsgPackDecoder: Decoder {
+class _MsgPackDecoder: Decoder {
     var codingPath: [CodingKey]
     var value: MsgPackValue
-    let rawData: Data?
-    var userInfo: [CodingUserInfoKey: Any] = [:]
+    let sourceData: Data
+    private let rawValue: MsgPackValue
+    var userInfo: [CodingUserInfoKey: Any]
 
-    init(from value: MsgPackValue, at codingPath: [CodingKey] = []) {
-        rawData = value.rawData
+    var rawData: Data? {
+        rawValue.rawData(from: sourceData)
+    }
+
+    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = []) {
+        self.sourceData = sourceData
+        rawValue = value
+        self.userInfo = userInfo
         self.value = value.stripped
         self.codingPath = codingPath
     }
@@ -131,7 +162,7 @@ private class _MsgPackDecoder: Decoder {
             ))
         }
 
-        return MsgPackUnkeyedUnkeyedDecodingContainer(referencing: self, container: value)
+        return MsgPackUnkeyedDecodingContainer(referencing: self, container: value)
     }
 
     func singleValueContainer() throws -> SingleValueDecodingContainer {
@@ -140,12 +171,27 @@ private class _MsgPackDecoder: Decoder {
 }
 
 private extension _MsgPackDecoder {
-    func unbox(_ value: MsgPackValue, as type: Bool.Type) throws -> Bool? {
+    func valueNotFound<T>(_ type: T.Type) -> DecodingError {
+        DecodingError.valueNotFound(type, DecodingError.Context(
+            codingPath: codingPath,
+            debugDescription: "Cannot get value of type \(type) -- found nil value instead."
+        ))
+    }
+
+    func numberDoesNotFit<T, V>(_ v: V, in type: T.Type) -> DecodingError {
+        DecodingError.dataCorrupted(DecodingError.Context(
+            codingPath: codingPath,
+            debugDescription: "Parsed MessagePack number \(v) does not fit in \(type)."
+        ))
+    }
+
+    func unbox(_ value: MsgPackValue, as type: Bool.Type) throws -> Bool {
         let value = value.stripped
         if case let .literal(value) = value {
             switch value {
             case let .bool(v): return v
-            case .nil: return nil
+            case .nil:
+                throw valueNotFound(type)
             default:
                 break
             }
@@ -157,14 +203,20 @@ private extension _MsgPackDecoder {
         ))
     }
 
-    func unbox(_ value: MsgPackValue, as type: String.Type) throws -> String? {
+    func unbox(_ value: MsgPackValue, as type: String.Type) throws -> String {
         let value = value.stripped
         if case let .literal(value) = value {
             switch value {
             case let .str(v):
-                return String._tryFromUTF8(v)
+                guard let s = String._tryFromUTF8(v) else {
+                    throw DecodingError.dataCorrupted(DecodingError.Context(
+                        codingPath: codingPath,
+                        debugDescription: "The given string is not valid UTF-8."
+                    ))
+                }
+                return s
             case .nil:
-                return nil
+                throw valueNotFound(type)
             default:
                 break
             }
@@ -176,7 +228,7 @@ private extension _MsgPackDecoder {
         ))
     }
 
-    func unboxFloat32(_ value: MsgPackValue) throws -> Float? {
+    func unboxFloat32(_ value: MsgPackValue) throws -> Float {
         let value = value.stripped
         if case let .literal(f) = value {
             switch f {
@@ -184,8 +236,12 @@ private extension _MsgPackDecoder {
                 return v
             case let .float64(v):
                 return Float(v)
+            case let .int(v):
+                return Float(v)
+            case let .uint(v):
+                return Float(v)
             case .nil:
-                return nil
+                throw valueNotFound(Float.self)
             default:
                 break
             }
@@ -197,7 +253,7 @@ private extension _MsgPackDecoder {
         ))
     }
 
-    func unboxFloat64(_ value: MsgPackValue) throws -> Double? {
+    func unboxFloat64(_ value: MsgPackValue) throws -> Double {
         let value = value.stripped
         if case let .literal(f) = value {
             switch f {
@@ -205,8 +261,12 @@ private extension _MsgPackDecoder {
                 return Double(v)
             case let .float64(v):
                 return v
+            case let .int(v):
+                return Double(v)
+            case let .uint(v):
+                return Double(v)
             case .nil:
-                return nil
+                throw valueNotFound(Double.self)
             default:
                 break
             }
@@ -222,14 +282,24 @@ private extension _MsgPackDecoder {
         let value = value.stripped
         if case let .literal(vv) = value {
             switch vv {
-            case let .uint(v), let .int(v):
-                return T(truncatingIfNeeded: v)
+            case let .uint(v):
+                guard let n = T(exactly: v) else {
+                    throw numberDoesNotFit(v, in: T.self)
+                }
+                return n
+            case let .int(v):
+                guard let n = T(exactly: v) else {
+                    throw numberDoesNotFit(v, in: T.self)
+                }
+                return n
+            case .nil:
+                throw valueNotFound(T.self)
             default:
                 break
             }
         }
 
-        throw DecodingError.typeMismatch(Int8.self, DecodingError.Context(
+        throw DecodingError.typeMismatch(T.self, DecodingError.Context(
             codingPath: codingPath,
             debugDescription: "Expected to decode \(T.self) but found \(value.debugDataTypeDescription) instead."
         ))
@@ -240,13 +310,23 @@ private extension _MsgPackDecoder {
         if case let .literal(literal) = value {
             switch literal {
             case let .uint(v):
-                return T(truncatingIfNeeded: v)
+                guard let n = T(exactly: v) else {
+                    throw numberDoesNotFit(v, in: T.self)
+                }
+                return n
+            case let .int(v):
+                guard let n = T(exactly: v) else {
+                    throw numberDoesNotFit(v, in: T.self)
+                }
+                return n
+            case .nil:
+                throw valueNotFound(T.self)
             default:
                 break
             }
         }
 
-        throw DecodingError.typeMismatch(UInt.self, DecodingError.Context(
+        throw DecodingError.typeMismatch(T.self, DecodingError.Context(
             codingPath: codingPath,
             debugDescription: "Expected to decode \(T.self) but found \(value.debugDataTypeDescription) instead."
         ))
@@ -355,19 +435,19 @@ private struct _MsgPackSingleValueDecodingContainer: SingleValueDecodingContaine
     }
 
     func decode(_: Bool.Type) throws -> Bool {
-        try decoder.unbox(value, as: Bool.self)!
+        try decoder.unbox(value, as: Bool.self)
     }
 
     func decode(_ type: String.Type) throws -> String {
-        try decoder.unbox(value, as: type)!
+        try decoder.unbox(value, as: type)
     }
 
     func decode(_: Double.Type) throws -> Double {
-        try decoder.unboxFloat64(value)!
+        try decoder.unboxFloat64(value)
     }
 
     func decode(_: Float.Type) throws -> Float {
-        try decoder.unboxFloat32(value)!
+        try decoder.unboxFloat32(value)
     }
 
     func decode(_: Int.Type) throws -> Int {
@@ -425,7 +505,7 @@ private struct _MsgPackSingleValueDecodingContainer: SingleValueDecodingContaine
     }
 }
 
-private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer {
+private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     private enum Source {
         case eager([MsgPackValue])
         case lazy(LazyArrayCursor)
@@ -501,13 +581,13 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     mutating func decode(_: Bool.Type) throws -> Bool {
         let value = try getNextValue(ofType: String.self)
         currentIndex += 1
-        return try decoder.unbox(value, as: Bool.self)!
+        return try decoder.unbox(value, as: Bool.self)
     }
 
     mutating func decode(_: String.Type) throws -> String {
         let value = try getNextValue(ofType: String.self)
         currentIndex += 1
-        return try decoder.unbox(value, as: String.self)!
+        return try decoder.unbox(value, as: String.self)
     }
 
     mutating func decode(_: Double.Type) throws -> Double {
@@ -559,7 +639,7 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
         try decodeUInt()
     }
 
-    mutating func decode64(_: UInt64.Type) throws -> UInt64 {
+    mutating func decode(_: UInt64.Type) throws -> UInt64 {
         try decodeUInt()
     }
 
@@ -585,14 +665,14 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     private mutating func decoderForNextElement<T>(ofType _: T.Type) throws -> _MsgPackDecoder {
         let value = try getNextValue(ofType: T.self)
         let newPath = codingPath + [MsgPackKey(index: currentIndex)]
-        return _MsgPackDecoder(from: value, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
     private func getNextValue<T>(ofType _: T.Type) throws -> MsgPackValue {
         guard !isAtEnd else {
             let message: String
-            if T.self == MsgPackUnkeyedUnkeyedDecodingContainer.self {
+            if T.self == MsgPackUnkeyedDecodingContainer.self {
                 message = "Cannot get nested unkeyed container -- unkeyed container is at end."
             } else if T.self == Decoder.self {
                 message = "Cannot get superDecoder() -- unkeyed container is at end."
@@ -634,7 +714,7 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     @inline(__always)
     private mutating func decodeFloat32() throws -> Float {
         let value = try getNextValue(ofType: Float.self)
-        let result = try decoder.unboxFloat32(value)!
+        let result = try decoder.unboxFloat32(value)
         currentIndex += 1
         return result
     }
@@ -642,7 +722,7 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     @inline(__always)
     private mutating func decodeFloat64() throws -> Double {
         let value = try getNextValue(ofType: Double.self)
-        let result = try decoder.unboxFloat64(value)!
+        let result = try decoder.unboxFloat64(value)
         currentIndex += 1
         return result
     }
@@ -682,17 +762,26 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private var source: Source
 
     static func asDictionary(value msgPackValue: MsgPackValue, using decoder: _MsgPackDecoder) -> [String: MsgPackValue] {
-        var result = [String: MsgPackValue]()
-        let a = msgPackValue.asDictionary()
-        result.reserveCapacity(a.count)
-        for (keyvalue, value) in a {
-            guard let key = try? decoder.unbox(keyvalue, as: String.self) else {
-                continue
+        switch msgPackValue.stripped {
+        case let .array(flat), let .map(flat):
+            let n = flat.count / 2
+            var result = [String: MsgPackValue]()
+            result.reserveCapacity(n)
+            for i in 0 ..< n {
+                guard let key = try? decoder.unbox(flat[i * 2], as: String.self) else { continue }
+                result[key]._setIfNil(to: flat[i * 2 + 1])
             }
-            result[key]._setIfNil(to: value)
+            return result
+        default:
+            var result = [String: MsgPackValue]()
+            let a = msgPackValue.asDictionary()
+            result.reserveCapacity(a.count)
+            for (keyvalue, value) in a {
+                guard let key = try? decoder.unbox(keyvalue, as: String.self) else { continue }
+                result[key]._setIfNil(to: value)
+            }
+            return result
         }
-
-        return result
     }
 
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
@@ -724,12 +813,12 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
 
     func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool {
         let value = try getValue(forKey: key)
-        return try decoder.unbox(value, as: type)!
+        return try decoder.unbox(value, as: type)
     }
 
     func decode(_ type: String.Type, forKey key: Key) throws -> String {
         let value = try getValue(forKey: key)
-        return try decoder.unbox(value, as: type)!
+        return try decoder.unbox(value, as: type)
     }
 
     func decode(_: Double.Type, forKey key: Key) throws -> Double {
@@ -821,7 +910,7 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private func decoderForKey<LocalKey: CodingKey>(_ key: LocalKey) throws -> _MsgPackDecoder {
         let value = try getValue(forKey: key)
         let newPath: [CodingKey] = codingPath + [key]
-        return _MsgPackDecoder(from: value, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
@@ -836,13 +925,13 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     @inline(__always)
     private func decodeFloat32(key: K) throws -> Float {
         let value = try getValue(forKey: key)
-        return try decoder.unboxFloat32(value)!
+        return try decoder.unboxFloat32(value)
     }
 
     @inline(__always)
     private func decodeFloat64(key: K) throws -> Double {
         let value = try getValue(forKey: key)
-        return try decoder.unboxFloat64(value)!
+        return try decoder.unboxFloat64(value)
     }
 
     @inline(__always)
@@ -873,21 +962,21 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
 }
 
 protocol DataNumber {
-    var bytes: [UInt8] { get }
+    func appendBytes(to buffer: inout [UInt8])
 }
 
 extension Float: DataNumber {
-    var bytes: [UInt8] {
+    func appendBytes(to buffer: inout [UInt8]) {
         withUnsafeBytes(of: bitPattern.bigEndian) {
-            Array($0)
+            buffer.append(contentsOf: $0)
         }
     }
 }
 
 extension Double: DataNumber {
-    var bytes: [UInt8] {
+    func appendBytes(to buffer: inout [UInt8]) {
         withUnsafeBytes(of: bitPattern.bigEndian) {
-            Array($0)
+            buffer.append(contentsOf: $0)
         }
     }
 }
