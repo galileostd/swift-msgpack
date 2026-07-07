@@ -36,6 +36,8 @@ open class MsgPackDecoder {
 
     let options: DecodingOption
 
+    open var userInfo: [CodingUserInfoKey: Any] = [:]
+
     public init() {
         options = []
     }
@@ -52,10 +54,11 @@ open class MsgPackDecoder {
     }
 
     open func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try data.withUnsafeBytes {
+        let data = Data(data)
+        return try data.withUnsafeBytes {
             let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
             let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data)
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
             do {
                 return try decoder.unwrap(as: T.self)
             } catch {
@@ -69,10 +72,11 @@ open class MsgPackDecoder {
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from data: Data, configuration: T.DecodingConfiguration) throws -> T {
-        try data.withUnsafeBytes {
+        let data = Data(data)
+        return try data.withUnsafeBytes {
             let scanner: MsgPackScanner = .init(source: data, ptr: $0.baseAddress!, count: $0.count)
             let value = scanRoot(scanner)
-            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data)
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
             do {
                 return try decoder.unwrap(as: T.self, configuration: configuration)
             } catch {
@@ -100,13 +104,18 @@ public typealias MsgPackCodable = MsgPackDecodable & MsgPackEncodable
 class _MsgPackDecoder: Decoder {
     var codingPath: [CodingKey]
     var value: MsgPackValue
-    let rawData: Data?
     let sourceData: Data
-    var userInfo: [CodingUserInfoKey: Any] = [:]
+    private let rawValue: MsgPackValue
+    var userInfo: [CodingUserInfoKey: Any]
 
-    init(from value: MsgPackValue, sourceData: Data, at codingPath: [CodingKey] = []) {
+    var rawData: Data? {
+        rawValue.rawData(from: sourceData)
+    }
+
+    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = []) {
         self.sourceData = sourceData
-        rawData = value.rawData(from: sourceData)
+        rawValue = value
+        self.userInfo = userInfo
         self.value = value.stripped
         self.codingPath = codingPath
     }
@@ -133,7 +142,7 @@ class _MsgPackDecoder: Decoder {
             ))
         }
 
-        return MsgPackUnkeyedUnkeyedDecodingContainer(referencing: self, container: value)
+        return MsgPackUnkeyedDecodingContainer(referencing: self, container: value)
     }
 
     func singleValueContainer() throws -> SingleValueDecodingContainer {
@@ -429,7 +438,7 @@ private struct _MsgPackSingleValueDecodingContainer: SingleValueDecodingContaine
     }
 }
 
-private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer {
+private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     private enum Source {
         case eager([MsgPackValue])
         case lazy(LazyArrayCursor)
@@ -563,7 +572,7 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
         try decodeUInt()
     }
 
-    mutating func decode64(_: UInt64.Type) throws -> UInt64 {
+    mutating func decode(_: UInt64.Type) throws -> UInt64 {
         try decodeUInt()
     }
 
@@ -589,14 +598,14 @@ private struct MsgPackUnkeyedUnkeyedDecodingContainer: UnkeyedDecodingContainer 
     private mutating func decoderForNextElement<T>(ofType _: T.Type) throws -> _MsgPackDecoder {
         let value = try getNextValue(ofType: T.self)
         let newPath = codingPath + [MsgPackKey(index: currentIndex)]
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
     private func getNextValue<T>(ofType _: T.Type) throws -> MsgPackValue {
         guard !isAtEnd else {
             let message: String
-            if T.self == MsgPackUnkeyedUnkeyedDecodingContainer.self {
+            if T.self == MsgPackUnkeyedDecodingContainer.self {
                 message = "Cannot get nested unkeyed container -- unkeyed container is at end."
             } else if T.self == Decoder.self {
                 message = "Cannot get superDecoder() -- unkeyed container is at end."
@@ -834,7 +843,7 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private func decoderForKey<LocalKey: CodingKey>(_ key: LocalKey) throws -> _MsgPackDecoder {
         let value = try getValue(forKey: key)
         let newPath: [CodingKey] = codingPath + [key]
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
@@ -886,21 +895,21 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
 }
 
 protocol DataNumber {
-    var bytes: [UInt8] { get }
+    func appendBytes(to buffer: inout [UInt8])
 }
 
 extension Float: DataNumber {
-    var bytes: [UInt8] {
+    func appendBytes(to buffer: inout [UInt8]) {
         withUnsafeBytes(of: bitPattern.bigEndian) {
-            Array($0)
+            buffer.append(contentsOf: $0)
         }
     }
 }
 
 extension Double: DataNumber {
-    var bytes: [UInt8] {
+    func appendBytes(to buffer: inout [UInt8]) {
         withUnsafeBytes(of: bitPattern.bigEndian) {
-            Array($0)
+            buffer.append(contentsOf: $0)
         }
     }
 }

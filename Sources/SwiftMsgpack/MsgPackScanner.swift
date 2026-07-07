@@ -97,7 +97,7 @@ extension MsgPackValue {
             }
             let n = a.count / 2
             var d = [(MsgPackValue, MsgPackValue)]()
-            d.reserveCapacity(n * 2)
+            d.reserveCapacity(n)
             for i in 0 ..< n {
                 let key = a[i * 2]
                 let value = a[i * 2 + 1]
@@ -107,7 +107,7 @@ extension MsgPackValue {
         case let .map(a):
             let n = a.count / 2
             var d = [(MsgPackValue, MsgPackValue)]()
-            d.reserveCapacity(n * 2)
+            d.reserveCapacity(n)
             for i in 0 ..< n {
                 let key = a[i * 2]
                 let value = a[i * 2 + 1]
@@ -121,7 +121,7 @@ extension MsgPackValue {
             }
             let n = a.count / 2
             var d = [(MsgPackValue, MsgPackValue)]()
-            d.reserveCapacity(n * 2)
+            d.reserveCapacity(n)
             for i in 0 ..< n {
                 d.append((a[i * 2], a[i * 2 + 1]))
             }
@@ -130,7 +130,7 @@ extension MsgPackValue {
             let a = c.entries()
             let n = a.count / 2
             var d = [(MsgPackValue, MsgPackValue)]()
-            d.reserveCapacity(n * 2)
+            d.reserveCapacity(n)
             for i in 0 ..< n {
                 d.append((a[i * 2], a[i * 2 + 1]))
             }
@@ -172,14 +172,16 @@ extension MsgPackValue {
                 bytes.append(contentsOf: data)
             case let .ext(_, data):
                 bytes.append(contentsOf: data)
-            case let .array(array):
+             case let .array(array):
                 let n = array.count
                 if n <= UInt.maxUint4 {
                     bytes.append(contentsOf: [UInt8(0x90 + n)])
                 } else if n <= UInt16.max {
-                    bytes.append(contentsOf: [0xDC] + n.bigEndianBytes(as: UInt16.self))
+                    bytes.append(contentsOf: [0xDC])
+                    UInt16(n).appendBigEndian(to: &bytes)
                 } else {
-                    bytes.append(contentsOf: [0xDD] + n.bigEndianBytes(as: UInt32.self))
+                    bytes.append(contentsOf: [0xDD])
+                    UInt32(n).appendBigEndian(to: &bytes)
                 }
                 for item in array {
                     writeValue(item, into: &bytes)
@@ -189,9 +191,11 @@ extension MsgPackValue {
                 if n <= UInt.maxUint4 {
                     bytes.append(contentsOf: [UInt8(0x80 + n)])
                 } else if n <= UInt16.max {
-                    bytes.append(contentsOf: [0xDE] + n.bigEndianBytes(as: UInt16.self))
+                    bytes.append(contentsOf: [0xDE])
+                    UInt16(n).appendBigEndian(to: &bytes)
                 } else {
-                    bytes.append(contentsOf: [0xDF] + n.bigEndianBytes(as: UInt32.self))
+                    bytes.append(contentsOf: [0xDF])
+                    UInt32(n).appendBigEndian(to: &bytes)
                 }
 
                 for i in 0 ..< n {
@@ -430,10 +434,8 @@ class MsgPackScanner {
         let n = getLength(c)
         var a: [MsgPackValue] = []
         a.reserveCapacity(n)
-        var i = 0
         for _ in 0 ..< n {
             a.append(scan())
-            i += 1
         }
         return .array(a)
     }
@@ -518,7 +520,7 @@ extension MsgPackScanner {
         case let .uint(c):
             _ = _scanUInt(c)
         case let .int(c):
-            _ = scanInt(c)
+            _skipInt(c)
         case let .str(c):
             advanced(by: getLength(c))
         case let .bin(c):
@@ -538,7 +540,25 @@ extension MsgPackScanner {
                 skipOne()
             }
         case let .simple(c):
-            _ = scanSimple(c)
+            _skipSimple(c)
+        }
+    }
+
+    private func _skipInt(_ c: UInt8) {
+        switch c {
+        case 0x80: advanced(by: 1)
+        case 0x81: advanced(by: 2)
+        case 0x82: advanced(by: 4)
+        case 0x83: advanced(by: 8)
+        default: break
+        }
+    }
+
+    private func _skipSimple(_ c: UInt8) {
+        switch c {
+        case 0xCA: advanced(by: 4)
+        case 0xCB: advanced(by: 8)
+        default: break
         }
     }
 }

@@ -37,12 +37,19 @@ extension MsgPackTimestamp: MsgPackCodable {
     public func encodeMsgPack() throws -> [UInt8] {
         if seconds >> 34 == 0 {
             if nanoseconds == 0 { // timestamp 32 bit
-                return seconds.bigEndianBytes(as: UInt32.self)
+                var bytes: [UInt8] = []
+                UInt32(seconds).appendBigEndian(to: &bytes)
+                return bytes
             }
             // timestamp 64 bit
-            let data: Int64 = .init(nanoseconds) << 34 | seconds
-            return data.bigEndianBytes(as: Int64.self)
+            let data: UInt64 = UInt64(nanoseconds) << 34 | UInt64(seconds)
+            var bytes: [UInt8] = []
+            data.appendBigEndian(to: &bytes)
+            return bytes
         }
-        return nanoseconds.bigEndianBytes(as: Int32.self) + seconds.bigEndianBytes(as: Int64.self)
+        var bytes: [UInt8] = []
+        nanoseconds.appendBigEndian(to: &bytes)
+        seconds.appendBigEndian(to: &bytes)
+        return bytes
     }
 }
