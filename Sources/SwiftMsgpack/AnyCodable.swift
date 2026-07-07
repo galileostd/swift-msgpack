@@ -150,28 +150,28 @@ extension AnyCodable: Decodable {
         switch value.stripped {
         case .literal(.nil):
             return AnyCodable(Self?.none)
-        case .literal(.bool(let v)):
+        case let .literal(.bool(v)):
             return AnyCodable(v)
-        case .literal(.uint(let v)):
+        case let .literal(.uint(v)):
             if v <= UInt64(Int.max) {
                 return AnyCodable(Int(v))
             }
             return AnyCodable(v)
-        case .literal(.int(let v)):
+        case let .literal(.int(v)):
             if v >= Int64(Int.min) {
                 return AnyCodable(Int(v))
             }
             return AnyCodable(v)
-        case .literal(.float32(let v)):
+        case let .literal(.float32(v)):
             return AnyCodable(Double(v))
-        case .literal(.float64(let v)):
+        case let .literal(.float64(v)):
             return AnyCodable(v)
-        case .literal(.str(let v)):
+        case let .literal(.str(v)):
             guard let s = String._tryFromUTF8(v) else {
                 throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "Invalid UTF-8 string"))
             }
             return AnyCodable(s)
-        case .literal(.bin(let v)):
+        case let .literal(.bin(v)):
             return AnyCodable(v)
         case .map, .lazyMap:
             let dict = try _decodeDictionary(from: value)
@@ -189,7 +189,7 @@ extension AnyCodable: Decodable {
         var dict = [AnyCodable: AnyCodable]()
         dict.reserveCapacity(pairs.count)
         for (k, v) in pairs {
-            dict[try _fromMsgPackValue(k)] = try _fromMsgPackValue(v)
+            try dict[_fromMsgPackValue(k)] = try _fromMsgPackValue(v)
         }
         return dict
     }

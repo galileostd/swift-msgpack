@@ -39,7 +39,7 @@ struct MsgPackStringKey {
     let msgPackValue: MsgPackEncodedValue
 }
 
-indirect enum MsgPackValue {
+enum MsgPackValue {
     case none
     case literal(MsgPackValueLiteralType)
     case ext(Int8, Data)
@@ -47,7 +47,7 @@ indirect enum MsgPackValue {
     case map([MsgPackValue])
     case lazyArray(LazyArrayCursor)
     case lazyMap(LazyMapCursor)
-    case raw(from: Int, count: Int, MsgPackValue)
+    indirect case raw(from: Int, count: Int, MsgPackValue)
 }
 
 extension MsgPackValue {
@@ -162,8 +162,42 @@ extension MsgPackValue {
     struct Writer {
         func writeValue(_ value: MsgPackEncodedValue) -> [UInt8] {
             var bytes: [UInt8] = .init()
+            bytes.reserveCapacity(byteSize(of: value))
             writeValue(value, into: &bytes)
             return bytes
+        }
+
+        private func containerHeaderSize(_ n: Int) -> Int {
+            if n <= UInt.maxUint4 {
+                return 1
+            }
+            if n <= UInt16.max {
+                return 3
+            }
+            return 5
+        }
+
+        private func byteSize(of value: MsgPackEncodedValue) -> Int {
+            switch value {
+            case .none:
+                return 0
+            case let .literal(data):
+                return data.count
+            case let .ext(_, data):
+                return data.count
+            case let .array(array):
+                var size = containerHeaderSize(array.count)
+                for item in array {
+                    size += byteSize(of: item)
+                }
+                return size
+            case let .map(a):
+                var size = containerHeaderSize(a.count / 2)
+                for item in a {
+                    size += byteSize(of: item)
+                }
+                return size
+            }
         }
 
         private func writeValue(_ value: MsgPackEncodedValue, into bytes: inout [UInt8]) {
@@ -172,15 +206,15 @@ extension MsgPackValue {
                 bytes.append(contentsOf: data)
             case let .ext(_, data):
                 bytes.append(contentsOf: data)
-             case let .array(array):
+            case let .array(array):
                 let n = array.count
                 if n <= UInt.maxUint4 {
-                    bytes.append(contentsOf: [UInt8(0x90 + n)])
+                    bytes.append(UInt8(0x90 + n))
                 } else if n <= UInt16.max {
-                    bytes.append(contentsOf: [0xDC])
+                    bytes.append(0xDC)
                     UInt16(n).appendBigEndian(to: &bytes)
                 } else {
-                    bytes.append(contentsOf: [0xDD])
+                    bytes.append(0xDD)
                     UInt32(n).appendBigEndian(to: &bytes)
                 }
                 for item in array {
@@ -189,12 +223,12 @@ extension MsgPackValue {
             case let .map(a):
                 let n = a.count / 2
                 if n <= UInt.maxUint4 {
-                    bytes.append(contentsOf: [UInt8(0x80 + n)])
+                    bytes.append(UInt8(0x80 + n))
                 } else if n <= UInt16.max {
-                    bytes.append(contentsOf: [0xDE])
+                    bytes.append(0xDE)
                     UInt16(n).appendBigEndian(to: &bytes)
                 } else {
-                    bytes.append(contentsOf: [0xDF])
+                    bytes.append(0xDF)
                     UInt32(n).appendBigEndian(to: &bytes)
                 }
 
@@ -204,8 +238,8 @@ extension MsgPackValue {
                     writeValue(key, into: &bytes)
                     writeValue(value, into: &bytes)
                 }
-            default:
-                bytes.append(contentsOf: [])
+            case .none:
+                break
             }
         }
     }
@@ -278,10 +312,14 @@ enum MsgPackOpCode {
 }
 
 class MsgPackScanner {
+    private static let maxNestingDepth = 512
+
     private let source: Data
     private let start: UnsafeRawPointer
     private var ptr: UnsafeRawPointer
     private let count: Int
+    private var depth = 0
+    private(set) var corrupt = false
 
     init(source: Data, ptr: UnsafeRawPointer, count: Int) {
         self.source = source
@@ -298,7 +336,20 @@ class MsgPackScanner {
         start.distance(to: ptr) >= count
     }
 
+    private var remaining: Int {
+        count - start.distance(to: ptr)
+    }
+
+    private func markCorrupt() {
+        corrupt = true
+        ptr = start.advanced(by: count)
+    }
+
     private func readUInt8() -> UInt8 {
+        guard remaining >= 1 else {
+            markCorrupt()
+            return 0
+        }
         defer {
             advanced(by: 1)
         }
@@ -306,13 +357,21 @@ class MsgPackScanner {
     }
 
     private func readInt8() -> Int8 {
+        guard remaining >= 1 else {
+            markCorrupt()
+            return 0
+        }
         defer {
             advanced(by: 1)
         }
         return ptr.load(as: Int8.self)
     }
 
-    private func readUnaligned<T>(as: T.Type) -> T {
+    private func readUnaligned<T: FixedWidthInteger>(as: T.Type) -> T {
+        guard remaining >= MemoryLayout<T>.size else {
+            markCorrupt()
+            return 0
+        }
         defer {
             advanced(by: MemoryLayout<T>.size)
         }
@@ -320,6 +379,10 @@ class MsgPackScanner {
     }
 
     private func readBuffer(_ n: Int) -> UnsafeBufferPointer<UInt8> {
+        guard n >= 0, n <= remaining else {
+            markCorrupt()
+            return UnsafeBufferPointer<UInt8>(start: nil, count: 0)
+        }
         defer {
             advanced(by: n)
         }
@@ -380,8 +443,16 @@ class MsgPackScanner {
         }
     }
 
+    // A container/blob claiming more elements/bytes than there are bytes
+    // left in the input can never be valid: every element takes at least
+    // one byte. Rejecting here bounds both reads and reserveCapacity.
     private func getLength(_ c: UInt8) -> Int {
-        Int(truncatingIfNeeded: _scanUInt(c))
+        let v = _scanUInt(c)
+        guard v <= UInt64(remaining) else {
+            markCorrupt()
+            return 0
+        }
+        return Int(v)
     }
 
     private func scanInt(_ c: UInt8) -> MsgPackValue {
@@ -430,11 +501,23 @@ class MsgPackScanner {
         }
     }
 
+    private func enterNesting() -> Bool {
+        if depth >= Self.maxNestingDepth {
+            markCorrupt()
+            return false
+        }
+        depth += 1
+        return true
+    }
+
     private func scanArray(_ c: UInt8) -> MsgPackValue {
         let n = getLength(c)
+        guard !corrupt, enterNesting() else { return .none }
+        defer { depth -= 1 }
         var a: [MsgPackValue] = []
         a.reserveCapacity(n)
         for _ in 0 ..< n {
+            if corrupt { break }
             a.append(scan())
         }
         return .array(a)
@@ -442,9 +525,12 @@ class MsgPackScanner {
 
     private func scanMap(_ c: UInt8) -> MsgPackValue {
         let n = getLength(c)
+        guard !corrupt, enterNesting() else { return .none }
+        defer { depth -= 1 }
         var a: [MsgPackValue] = []
         a.reserveCapacity(n * 2)
         for _ in 0 ..< n {
+            if corrupt { break }
             a.append(scan())
             a.append(scan())
         }
@@ -489,20 +575,26 @@ extension MsgPackScanner {
             return scanExtension(c)
         case let .array(c):
             let n = getLength(c)
+            guard !corrupt, enterNesting() else { return .none }
+            defer { depth -= 1 }
             let start = ptr
             var positions: [UnsafeRawPointer] = []
             positions.reserveCapacity(n)
             for _ in 0 ..< n {
+                if corrupt { return .none }
                 positions.append(ptr)
                 skipOne()
             }
             return .lazyArray(LazyArrayCursor(scanner: self, start: start, count: n, positions: positions))
         case let .map(c):
             let n = getLength(c)
+            guard !corrupt, enterNesting() else { return .none }
+            defer { depth -= 1 }
             let start = ptr
             var positions: [UnsafeRawPointer] = []
             positions.reserveCapacity(n)
             for _ in 0 ..< n {
+                if corrupt { return .none }
                 positions.append(ptr)
                 skipOne()
                 skipOne()
@@ -511,6 +603,14 @@ extension MsgPackScanner {
         case let .simple(c):
             return scanSimple(c)
         }
+    }
+
+    private func skipBytes(_ n: Int) {
+        guard n >= 0, n <= remaining else {
+            markCorrupt()
+            return
+        }
+        advanced(by: n)
     }
 
     func skipOne() {
@@ -522,20 +622,26 @@ extension MsgPackScanner {
         case let .int(c):
             _skipInt(c)
         case let .str(c):
-            advanced(by: getLength(c))
+            skipBytes(getLength(c))
         case let .bin(c):
-            advanced(by: getLength(c))
+            skipBytes(getLength(c))
         case let .ext(c):
             let n = getLength(c)
-            advanced(by: 1 + n)
+            skipBytes(1 + n)
         case let .array(c):
             let n = getLength(c)
+            guard !corrupt, enterNesting() else { return }
+            defer { depth -= 1 }
             for _ in 0 ..< n {
+                if corrupt { return }
                 skipOne()
             }
         case let .map(c):
             let n = getLength(c)
+            guard !corrupt, enterNesting() else { return }
+            defer { depth -= 1 }
             for _ in 0 ..< n {
+                if corrupt { return }
                 skipOne()
                 skipOne()
             }
@@ -546,18 +652,18 @@ extension MsgPackScanner {
 
     private func _skipInt(_ c: UInt8) {
         switch c {
-        case 0x80: advanced(by: 1)
-        case 0x81: advanced(by: 2)
-        case 0x82: advanced(by: 4)
-        case 0x83: advanced(by: 8)
+        case 0x80: skipBytes(1)
+        case 0x81: skipBytes(2)
+        case 0x82: skipBytes(4)
+        case 0x83: skipBytes(8)
         default: break
         }
     }
 
     private func _skipSimple(_ c: UInt8) {
         switch c {
-        case 0xCA: advanced(by: 4)
-        case 0xCB: advanced(by: 8)
+        case 0xCA: skipBytes(4)
+        case 0xCB: skipBytes(8)
         default: break
         }
     }
