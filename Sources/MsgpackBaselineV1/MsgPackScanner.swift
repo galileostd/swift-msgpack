@@ -34,40 +34,44 @@ extension MsgPackValueLiteralType {
     }
 }
 
-/// A scanned MessagePack value. A struct rather than an indirect enum so the
-/// per-value byte span travels inline with the payload: building the value
-/// tree allocates only the container arrays, never a box per value.
-struct MsgPackValue {
-    enum Kind {
-        case none
-        case literal(MsgPackValueLiteralType)
-        case ext(Int8, Data)
-        case array([MsgPackValue])
-        case map([MsgPackValue])
-        case lazyArray(LazyArrayCursor)
-        case lazyMap(LazyMapCursor)
-    }
+struct MsgPackStringKey {
+    let stringValue: String
+    let msgPackValue: MsgPackEncodedValue
+}
 
-    var kind: Kind
-    /// Byte span of this value in the source buffer; `count == 0` means the
-    /// span is unknown (nothing was consumed producing this value).
-    var from: Int = 0
-    var count: Int = 0
-
-    static var none: MsgPackValue { MsgPackValue(kind: .none) }
+enum MsgPackValue {
+    case none
+    case literal(MsgPackValueLiteralType)
+    case ext(Int8, Data)
+    case array([MsgPackValue])
+    case map([MsgPackValue])
+    case lazyArray(LazyArrayCursor)
+    case lazyMap(LazyMapCursor)
+    indirect case raw(from: Int, count: Int, MsgPackValue)
 }
 
 extension MsgPackValue {
+    var stripped: MsgPackValue {
+        if case let .raw(_, _, inner) = self {
+            return inner.stripped
+        }
+        return self
+    }
+
     func rawData(from source: Data) -> Data? {
-        guard count > 0 else { return nil }
-        let start = source.startIndex + from
-        return source.subdata(in: start ..< (start + count))
+        if case let .raw(from, count, _) = self {
+            let start = source.startIndex + from
+            return source.subdata(in: start ..< (start + count))
+        }
+        return nil
     }
 }
 
 extension MsgPackValue {
     func asArray() -> [MsgPackValue] {
-        switch kind {
+        switch self {
+        case let .raw(_, _, inner):
+            return inner.asArray()
         case .none:
             return []
         case .literal, .ext:
@@ -82,7 +86,9 @@ extension MsgPackValue {
     }
 
     func asDictionary() -> [(MsgPackValue, MsgPackValue)] {
-        switch kind {
+        switch self {
+        case let .raw(_, _, inner):
+            return inner.asDictionary()
         case .none, .literal, .ext:
             return []
         case let .array(a):
@@ -135,7 +141,9 @@ extension MsgPackValue {
 
 extension MsgPackValue {
     var debugDataTypeDescription: String {
-        switch kind {
+        switch self {
+        case let .raw(_, _, inner):
+            return inner.debugDataTypeDescription
         case .none:
             return "none"
         case let .literal(v):
@@ -146,6 +154,93 @@ extension MsgPackValue {
             return "an array"
         case .map, .lazyMap:
             return "a map"
+        }
+    }
+}
+
+extension MsgPackValue {
+    struct Writer {
+        func writeValue(_ value: MsgPackEncodedValue) -> [UInt8] {
+            var bytes: [UInt8] = .init()
+            bytes.reserveCapacity(byteSize(of: value))
+            writeValue(value, into: &bytes)
+            return bytes
+        }
+
+        private func containerHeaderSize(_ n: Int) -> Int {
+            if n <= UInt.maxUint4 {
+                return 1
+            }
+            if n <= UInt16.max {
+                return 3
+            }
+            return 5
+        }
+
+        private func byteSize(of value: MsgPackEncodedValue) -> Int {
+            switch value {
+            case .none:
+                return 0
+            case let .literal(data):
+                return data.count
+            case let .ext(_, data):
+                return data.count
+            case let .array(array):
+                var size = containerHeaderSize(array.count)
+                for item in array {
+                    size += byteSize(of: item)
+                }
+                return size
+            case let .map(a):
+                var size = containerHeaderSize(a.count / 2)
+                for item in a {
+                    size += byteSize(of: item)
+                }
+                return size
+            }
+        }
+
+        private func writeValue(_ value: MsgPackEncodedValue, into bytes: inout [UInt8]) {
+            switch value {
+            case let .literal(data):
+                bytes.append(contentsOf: data)
+            case let .ext(_, data):
+                bytes.append(contentsOf: data)
+            case let .array(array):
+                let n = array.count
+                if n <= UInt.maxUint4 {
+                    bytes.append(UInt8(0x90 + n))
+                } else if n <= UInt16.max {
+                    bytes.append(0xDC)
+                    UInt16(n).appendBigEndian(to: &bytes)
+                } else {
+                    bytes.append(0xDD)
+                    UInt32(n).appendBigEndian(to: &bytes)
+                }
+                for item in array {
+                    writeValue(item, into: &bytes)
+                }
+            case let .map(a):
+                let n = a.count / 2
+                if n <= UInt.maxUint4 {
+                    bytes.append(UInt8(0x80 + n))
+                } else if n <= UInt16.max {
+                    bytes.append(0xDE)
+                    UInt16(n).appendBigEndian(to: &bytes)
+                } else {
+                    bytes.append(0xDF)
+                    UInt32(n).appendBigEndian(to: &bytes)
+                }
+
+                for i in 0 ..< n {
+                    let key = a[i * 2]
+                    let value = a[i * 2 + 1]
+                    writeValue(key, into: &bytes)
+                    writeValue(value, into: &bytes)
+                }
+            case .none:
+                break
+            }
         }
     }
 }
@@ -219,13 +314,15 @@ enum MsgPackOpCode {
 class MsgPackScanner {
     private static let maxNestingDepth = 512
 
+    private let source: Data
     private let start: UnsafeRawPointer
     private var ptr: UnsafeRawPointer
     private let count: Int
     private var depth = 0
     private(set) var corrupt = false
 
-    init(ptr: UnsafeRawPointer, count: Int) {
+    init(source: Data, ptr: UnsafeRawPointer, count: Int) {
+        self.source = source
         start = ptr
         self.ptr = ptr
         self.count = count
@@ -296,12 +393,15 @@ class MsgPackScanner {
 
     func scan() -> MsgPackValue {
         let begin = start.distance(to: ptr)
-        let kind = scanInner()
+        let inner = scanInner()
         let end = start.distance(to: ptr)
-        return MsgPackValue(kind: kind, from: begin, count: max(0, end - begin))
+        if end <= begin {
+            return inner
+        }
+        return .raw(from: begin, count: end - begin, inner)
     }
 
-    private func scanInner() -> MsgPackValue.Kind {
+    private func scanInner() -> MsgPackValue {
         switch readOpCode() {
         case .end, .neverUsed:
             .none
@@ -324,7 +424,7 @@ class MsgPackScanner {
         }
     }
 
-    private func scanUInt(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanUInt(_ c: UInt8) -> MsgPackValue {
         .literal(.uint(_scanUInt(c)))
     }
 
@@ -355,7 +455,7 @@ class MsgPackScanner {
         return Int(v)
     }
 
-    private func scanInt(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanInt(_ c: UInt8) -> MsgPackValue {
         switch c {
         case 0x80:
             .literal(.int(Int64(readInt8())))
@@ -370,21 +470,21 @@ class MsgPackScanner {
         }
     }
 
-    private func scanString(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanString(_ c: UInt8) -> MsgPackValue {
         .literal(.str(readBuffer(getLength(c))))
     }
 
-    private func scanBinary(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanBinary(_ c: UInt8) -> MsgPackValue {
         .literal(.bin(.init(buffer: readBuffer(getLength(c)))))
     }
 
-    private func scanExtension(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanExtension(_ c: UInt8) -> MsgPackValue {
         let n = getLength(c)
         let typeNo = Int8(bitPattern: readUInt8())
         return .ext(typeNo, .init(buffer: readBuffer(n)))
     }
 
-    private func scanSimple(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanSimple(_ c: UInt8) -> MsgPackValue {
         switch c {
         case 0xC0:
             .literal(.nil)
@@ -410,7 +510,7 @@ class MsgPackScanner {
         return true
     }
 
-    private func scanArray(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanArray(_ c: UInt8) -> MsgPackValue {
         let n = getLength(c)
         guard !corrupt, enterNesting() else { return .none }
         defer { depth -= 1 }
@@ -423,7 +523,7 @@ class MsgPackScanner {
         return .array(a)
     }
 
-    private func scanMap(_ c: UInt8) -> MsgPackValue.Kind {
+    private func scanMap(_ c: UInt8) -> MsgPackValue {
         let n = getLength(c)
         guard !corrupt, enterNesting() else { return .none }
         defer { depth -= 1 }
@@ -451,12 +551,15 @@ extension MsgPackScanner {
 
     func scanLazy() -> MsgPackValue {
         let begin = start.distance(to: ptr)
-        let kind = scanLazyInner()
+        let inner = scanLazyInner()
         let end = start.distance(to: ptr)
-        return MsgPackValue(kind: kind, from: begin, count: max(0, end - begin))
+        if end <= begin {
+            return inner
+        }
+        return .raw(from: begin, count: end - begin, inner)
     }
 
-    private func scanLazyInner() -> MsgPackValue.Kind {
+    func scanLazyInner() -> MsgPackValue {
         switch readOpCode() {
         case .end, .neverUsed:
             return .none

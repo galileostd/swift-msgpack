@@ -55,73 +55,56 @@ open class MsgPackDecoder {
 
     open func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         try data.withUnsafeBytes { rawBuffer in
-            try decodeCore(type, base: rawBuffer.baseAddress, count: rawBuffer.count, source: data) {
-                try $0.unwrap(as: T.self)
+            let value: MsgPackValue
+            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
+                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
+                value = scanRoot(scanner)
+                if scanner.corrupt {
+                    throw DecodingError.dataCorrupted(.init(
+                        codingPath: [],
+                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
+                    ))
+                }
+            } else {
+                value = .none
             }
-        }
-    }
-
-    /// Decodes a value directly from a raw byte buffer, without wrapping it
-    /// in `Data`. Intended for batch consumers that read many records into
-    /// one contiguous block and decode each record in place from a rebased
-    /// slice of that block.
-    ///
-    /// - Important: `buffer` must stay valid for the duration of the call.
-    ///   Nothing derived from it is retained past the return: a decoded
-    ///   `MsgPackRawValue`/`Data` field copies its bytes out.
-    open func decode<T: Decodable>(_ type: T.Type, from buffer: UnsafeRawBufferPointer) throws -> T {
-        try decodeCore(type, base: buffer.baseAddress, count: buffer.count, source: borrowedData(buffer)) {
-            try $0.unwrap(as: T.self)
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
+            do {
+                return try decoder.unwrap(as: T.self)
+            } catch {
+                if let error = error as? MsgPackDecodingError {
+                    throw error.asDecodingError(type, codingPath: [])
+                }
+                throw error
+            }
         }
     }
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from data: Data, configuration: T.DecodingConfiguration) throws -> T {
         try data.withUnsafeBytes { rawBuffer in
-            try decodeCore(type, base: rawBuffer.baseAddress, count: rawBuffer.count, source: data) {
-                try $0.unwrap(as: T.self, configuration: configuration)
+            let value: MsgPackValue
+            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
+                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
+                value = scanRoot(scanner)
+                if scanner.corrupt {
+                    throw DecodingError.dataCorrupted(.init(
+                        codingPath: [],
+                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
+                    ))
+                }
+            } else {
+                value = .none
             }
-        }
-    }
-
-    /// Buffer-based variant of ``decode(_:from:configuration:)``. See
-    /// ``decode(_:from:)-swift.method`` for the lifetime contract.
-    @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
-    open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from buffer: UnsafeRawBufferPointer, configuration: T.DecodingConfiguration) throws -> T {
-        try decodeCore(type, base: buffer.baseAddress, count: buffer.count, source: borrowedData(buffer)) {
-            try $0.unwrap(as: T.self, configuration: configuration)
-        }
-    }
-
-    /// A no-copy `Data` view of `buffer`, used only as the slicing source for
-    /// `MsgPackRawValue` fields. It never outlives the decode call.
-    private func borrowedData(_ buffer: UnsafeRawBufferPointer) -> Data {
-        guard let base = buffer.baseAddress, !buffer.isEmpty else { return Data() }
-        return Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: buffer.count, deallocator: .none)
-    }
-
-    private func decodeCore<T>(_ type: T.Type, base: UnsafeRawPointer?, count: Int, source: Data, _ unwrap: (_MsgPackDecoder) throws -> T) throws -> T {
-        let value: MsgPackValue
-        if let base, count > 0 {
-            let scanner: MsgPackScanner = .init(ptr: base, count: count)
-            value = scanRoot(scanner)
-            if scanner.corrupt {
-                throw DecodingError.dataCorrupted(.init(
-                    codingPath: [],
-                    debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
-                ))
+            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
+            do {
+                return try decoder.unwrap(as: T.self, configuration: configuration)
+            } catch {
+                if let error = error as? MsgPackDecodingError {
+                    throw error.asDecodingError(type, codingPath: [])
+                }
+                throw error
             }
-        } else {
-            value = .none
-        }
-        let decoder: _MsgPackDecoder = .init(from: value, sourceData: source, userInfo: userInfo)
-        do {
-            return try unwrap(decoder)
-        } catch {
-            if let error = error as? MsgPackDecodingError {
-                throw error.asDecodingError(type, codingPath: [])
-            }
-            throw error
         }
     }
 
@@ -139,30 +122,26 @@ public protocol MsgPackDecodable: Decodable {
 public typealias MsgPackCodable = MsgPackDecodable & MsgPackEncodable
 
 class _MsgPackDecoder: Decoder {
-    /// The coding path is `basePath` + `tail`, materialised only when
-    /// something actually reads `codingPath` (error contexts, custom
-    /// decoders) — creating a sub-decoder per field never allocates it.
-    let basePath: [CodingKey]
-    let tail: MsgPackPathTail
-    var codingPath: [CodingKey] { tail.appended(to: basePath) }
+    var codingPath: [CodingKey]
     var value: MsgPackValue
     let sourceData: Data
+    private let rawValue: MsgPackValue
     var userInfo: [CodingUserInfoKey: Any]
 
     var rawData: Data? {
-        value.rawData(from: sourceData)
+        rawValue.rawData(from: sourceData)
     }
 
-    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = [], tail: MsgPackPathTail = .none) {
+    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = []) {
         self.sourceData = sourceData
+        rawValue = value
         self.userInfo = userInfo
-        self.value = value
-        basePath = codingPath
-        self.tail = tail
+        self.value = value.stripped
+        self.codingPath = codingPath
     }
 
     func container<Key>(keyedBy _: Key.Type) throws -> KeyedDecodingContainer<Key> where Key: CodingKey {
-        switch value.kind {
+        switch value {
         case .map, .lazyMap: break
         default:
             throw DecodingError.typeMismatch([String: Any].self, DecodingError.Context(
@@ -174,7 +153,7 @@ class _MsgPackDecoder: Decoder {
     }
 
     func unkeyedContainer() throws -> UnkeyedDecodingContainer {
-        switch value.kind {
+        switch value {
         case .array, .map, .none, .lazyArray, .lazyMap: break
         default:
             throw DecodingError.typeMismatch([Any].self, DecodingError.Context(
@@ -187,7 +166,7 @@ class _MsgPackDecoder: Decoder {
     }
 
     func singleValueContainer() throws -> SingleValueDecodingContainer {
-        _MsgPackSingleValueDecodingContainer(decoder: self, value: value)
+        _MsgPackSingleValueDecodingContainer(decoder: self, codingPath: codingPath, value: value)
     }
 }
 
@@ -207,7 +186,8 @@ private extension _MsgPackDecoder {
     }
 
     func unbox(_ value: MsgPackValue, as type: Bool.Type) throws -> Bool {
-        if case let .literal(value) = value.kind {
+        let value = value.stripped
+        if case let .literal(value) = value {
             switch value {
             case let .bool(v): return v
             case .nil:
@@ -224,7 +204,8 @@ private extension _MsgPackDecoder {
     }
 
     func unbox(_ value: MsgPackValue, as type: String.Type) throws -> String {
-        if case let .literal(value) = value.kind {
+        let value = value.stripped
+        if case let .literal(value) = value {
             switch value {
             case let .str(v):
                 guard let s = String._tryFromUTF8(v) else {
@@ -248,7 +229,8 @@ private extension _MsgPackDecoder {
     }
 
     func unboxFloat32(_ value: MsgPackValue) throws -> Float {
-        if case let .literal(f) = value.kind {
+        let value = value.stripped
+        if case let .literal(f) = value {
             switch f {
             case let .float32(v):
                 return v
@@ -272,7 +254,8 @@ private extension _MsgPackDecoder {
     }
 
     func unboxFloat64(_ value: MsgPackValue) throws -> Double {
-        if case let .literal(f) = value.kind {
+        let value = value.stripped
+        if case let .literal(f) = value {
             switch f {
             case let .float32(v):
                 return Double(v)
@@ -296,7 +279,8 @@ private extension _MsgPackDecoder {
     }
 
     func unboxInt<T: SignedInteger & FixedWidthInteger>(_ value: MsgPackValue) throws -> T {
-        if case let .literal(vv) = value.kind {
+        let value = value.stripped
+        if case let .literal(vv) = value {
             switch vv {
             case let .uint(v):
                 guard let n = T(exactly: v) else {
@@ -322,7 +306,8 @@ private extension _MsgPackDecoder {
     }
 
     func unboxUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: MsgPackValue) throws -> T {
-        if case let .literal(literal) = value.kind {
+        let value = value.stripped
+        if case let .literal(literal) = value {
             switch literal {
             case let .uint(v):
                 guard let n = T(exactly: v) else {
@@ -380,7 +365,7 @@ extension _MsgPackDecoder {
     }
 
     func unwrapData() throws -> Data {
-        switch value.kind {
+        switch value {
         case let .literal(.bin(v)):
             v
         case let .literal(.str(v)):
@@ -391,7 +376,7 @@ extension _MsgPackDecoder {
     }
 
     func unwrapMsgPackDecodable(as type: MsgPackDecodable.Type) throws -> MsgPackDecodable {
-        guard case let .ext(typeNo, data) = value.kind else {
+        guard case let .ext(typeNo, data) = value else {
             throw DecodingError.typeMismatch(MsgPackDecodable.self, DecodingError.Context(codingPath: codingPath, debugDescription: ""))
         }
         let value = try type.init(msgPack: data)
@@ -405,7 +390,7 @@ extension _MsgPackDecoder {
         guard (T.self as? (_MsgPackDictionaryDecodableMarker & Decodable).Type) != nil else {
             preconditionFailure("Must only be called of T implements _MsgPackDictionaryDecodableMarker")
         }
-        switch value.kind {
+        switch value {
         case .map, .lazyMap: break
         default:
             throw DecodingError.typeMismatch(T.self, DecodingError.Context(
@@ -419,7 +404,7 @@ extension _MsgPackDecoder {
         guard (T.self as? (_MsgPackArrayDecodableMarker & Decodable).Type) != nil else {
             preconditionFailure("Must only be called of T implements _MsgPackArrayDecodableMarker")
         }
-        switch value.kind {
+        switch value {
         case .array, .lazyArray: break
         default:
             throw DecodingError.typeMismatch([MsgPackValue].self, DecodingError.Context(
@@ -432,18 +417,17 @@ extension _MsgPackDecoder {
 
 private struct _MsgPackSingleValueDecodingContainer: SingleValueDecodingContainer {
     let decoder: _MsgPackDecoder
+    let codingPath: [CodingKey]
     let value: MsgPackValue
-    /// Computed on demand — sub-decoders never mutate their path, and the
-    /// container only reads it on error exits.
-    var codingPath: [CodingKey] { decoder.codingPath }
 
-    init(decoder: _MsgPackDecoder, value: MsgPackValue) {
+    init(decoder: _MsgPackDecoder, codingPath: [CodingKey], value: MsgPackValue) {
         self.decoder = decoder
+        self.codingPath = codingPath
         self.value = value
     }
 
     func decodeNil() -> Bool {
-        if case .literal(.nil) = value.kind {
+        if case .literal(.nil) = value {
             return true
         } else {
             return false
@@ -542,17 +526,15 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 
     private let decoder: _MsgPackDecoder
+    private(set) var codingPath: [CodingKey]
     public private(set) var currentIndex: Int
     private var source: Source
 
-    /// Computed on demand — the decoder's path is immutable, and the
-    /// container reads it only on error exits and sub-decoder creation.
-    var codingPath: [CodingKey] { decoder.codingPath }
-
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
         self.decoder = decoder
+        codingPath = decoder.codingPath
         currentIndex = 0
-        if case let .lazyArray(c) = container.kind {
+        if case let .lazyArray(c) = container {
             source = .lazy(c)
         } else {
             source = .eager(container.asArray())
@@ -568,7 +550,7 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 
     mutating func decodeNil() throws -> Bool {
-        let value = try getNextValue(ofType: Never.self).kind
+        let value = try getNextValue(ofType: Never.self).stripped
         if case .literal(.nil) = value {
             currentIndex += 1
             return true
@@ -682,7 +664,8 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 
     private mutating func decoderForNextElement<T>(ofType _: T.Type) throws -> _MsgPackDecoder {
         let value = try getNextValue(ofType: T.self)
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: codingPath, tail: .index(currentIndex))
+        let newPath = codingPath + [MsgPackKey(index: currentIndex)]
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
@@ -745,127 +728,70 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 }
 
-/// Key lookup over an eagerly-scanned map without allocating a `String` per
-/// on-wire key. Declaration-order lookups are matched by raw UTF-8 byte
-/// comparison against a monotonic cursor (repeat lookups of the same key —
-/// the `decodeIfPresent` pattern — re-scan only the already-visited prefix).
-/// The first lookup that would make the linear phase expensive builds a
-/// keep-first `String` index once, restoring the old dictionary behaviour.
-final class EagerMapCursor {
-    /// Beyond this many visited pairs, a linear re-scan stops being cheaper
-    /// than materialising the key index.
-    private static let indexThreshold = 32
-
-    private let flat: [MsgPackValue]
-    private let pairCount: Int
-    private var cursor = 0
-    private var index: [String: Int]?
-
-    init(container: MsgPackValue) {
-        switch container.kind {
-        case let .array(a), let .map(a):
-            flat = a
-        default:
-            let pairs = container.asDictionary()
-            var f: [MsgPackValue] = []
-            f.reserveCapacity(pairs.count * 2)
-            for (k, v) in pairs {
-                f.append(k)
-                f.append(v)
-            }
-            flat = f
-        }
-        pairCount = flat.count / 2
-    }
-
-    func value(forStringKey key: String) -> MsgPackValue? {
-        if let index {
-            guard let i = index[key] else { return nil }
-            return flat[i * 2 + 1]
-        }
-        if cursor > Self.indexThreshold {
-            guard let i = ensureIndex()[key] else { return nil }
-            return flat[i * 2 + 1]
-        }
-        // 1. Already-visited pairs (repeat lookups, out-of-order keys).
-        for i in 0 ..< cursor where flat[i * 2].matchesKeyBytes(key) {
-            return flat[i * 2 + 1]
-        }
-        // 2. Walk forward; declaration-order decoding matches immediately.
-        while cursor < pairCount {
-            let i = cursor
-            cursor += 1
-            if flat[i * 2].matchesKeyBytes(key) {
-                return flat[i * 2 + 1]
-            }
-        }
-        return nil
-    }
-
-    func allStringKeys() -> [String] {
-        Array(ensureIndex().keys)
-    }
-
-    func contains(stringKey key: String) -> Bool {
-        value(forStringKey: key) != nil
-    }
-
-    private func ensureIndex() -> [String: Int] {
-        if let index { return index }
-        var d = [String: Int](minimumCapacity: pairCount)
-        for i in 0 ..< pairCount {
-            if case let .literal(.str(buf)) = flat[i * 2].kind, let s = String._tryFromUTF8(buf), d[s] == nil {
-                d[s] = i
-            }
-        }
-        index = d
-        return d
-    }
-}
-
 private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContainerProtocol {
     typealias Key = K
 
     private enum Source {
-        case eager(EagerMapCursor)
+        case eager([String: MsgPackValue])
         case lazy(LazyMapCursor)
 
         func value(forStringKey key: String) -> MsgPackValue? {
             switch self {
-            case let .eager(c): return c.value(forStringKey: key)
+            case let .eager(d): return d[key]
             case let .lazy(c): return c.value(forStringKey: key)
             }
         }
 
         func allStringKeys() -> [String] {
             switch self {
-            case let .eager(c): return c.allStringKeys()
+            case let .eager(d): return Array(d.keys)
             case let .lazy(c): return c.allStringKeys()
             }
         }
 
         func contains(stringKey key: String) -> Bool {
             switch self {
-            case let .eager(c): return c.contains(stringKey: key)
+            case let .eager(d): return d[key] != nil
             case let .lazy(c): return c.contains(stringKey: key)
             }
         }
     }
 
     private let decoder: _MsgPackDecoder
+    private(set) var codingPath: [CodingKey]
     private var source: Source
 
-    /// Computed on demand — the decoder's path is immutable, and the
-    /// container reads it only on error exits and sub-decoder creation.
-    var codingPath: [CodingKey] { decoder.codingPath }
+    static func asDictionary(value msgPackValue: MsgPackValue, using decoder: _MsgPackDecoder) -> [String: MsgPackValue] {
+        switch msgPackValue.stripped {
+        case let .array(flat), let .map(flat):
+            let n = flat.count / 2
+            var result = [String: MsgPackValue]()
+            result.reserveCapacity(n)
+            for i in 0 ..< n {
+                guard let key = try? decoder.unbox(flat[i * 2], as: String.self) else { continue }
+                result[key]._setIfNil(to: flat[i * 2 + 1])
+            }
+            return result
+        default:
+            var result = [String: MsgPackValue]()
+            let a = msgPackValue.asDictionary()
+            result.reserveCapacity(a.count)
+            for (keyvalue, value) in a {
+                guard let key = try? decoder.unbox(keyvalue, as: String.self) else { continue }
+                result[key]._setIfNil(to: value)
+            }
+            return result
+        }
+    }
 
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
         self.decoder = decoder
-        if case let .lazyMap(c) = container.kind {
+        if case let .lazyMap(c) = container {
             source = .lazy(c)
         } else {
-            source = .eager(EagerMapCursor(container: container))
+            source = .eager(Self.asDictionary(value: container, using: decoder))
         }
+        codingPath = decoder.codingPath
     }
 
     var allKeys: [Key] {
@@ -877,7 +803,8 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     }
 
     func decodeNil(forKey key: Key) throws -> Bool {
-        if case .literal(.nil) = try getValue(forKey: key).kind {
+        let value = try getValue(forKey: key).stripped
+        if case .literal(.nil) = value {
             return true
         } else {
             return false
@@ -982,7 +909,8 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
 
     private func decoderForKey<LocalKey: CodingKey>(_ key: LocalKey) throws -> _MsgPackDecoder {
         let value = try getValue(forKey: key)
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: codingPath, tail: .key(key))
+        let newPath: [CodingKey] = codingPath + [key]
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
     }
 
     @inline(__always)
@@ -1064,5 +992,12 @@ extension MsgPackDecodingError {
             let context = DecodingError.Context(codingPath: codingPath, debugDescription: "Expected to decode \(type) but it failed")
             return DecodingError.dataCorrupted(context)
         }
+    }
+}
+
+private extension Optional {
+    mutating func _setIfNil(to value: Wrapped) {
+        guard _fastPath(self == nil) else { return }
+        self = value
     }
 }
