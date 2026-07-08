@@ -180,3 +180,45 @@ print("| Shape | v1.3.0 (µs/op) | current (µs/op) |")
 print("|-------|---------------:|----------------:|")
 print("| 7×Int struct (no str/Date/array) | \(fmtNs(di7Base, ops: count)) | \(fmtNs(di7New, ops: count)) |")
 print("| HarnessUser (3 str + Date + [String]) | \(fmtNs(decBaseLazy, ops: count)) | \(fmtNs(decNewLazy, ops: count)) |")
+print("")
+
+// --- Zero-copy batch APIs (current only; the batch shape NyaruDB2 uses) ---
+// encode: one Data per doc vs appending into one reused contiguous buffer.
+let encPerDoc = try measure { var a = 0; for u in users {
+    a &+= try newEnc.encode(u).count
+}; return a }
+var batchBuf: [UInt8] = []
+batchBuf.reserveCapacity(count * 160)
+let encIntoBatch = try measure {
+    batchBuf.removeAll(keepingCapacity: true)
+    for u in users {
+        try newEnc.encode(u, into: &batchBuf)
+    }
+    return batchBuf.count
+}
+
+// decode: one contiguous block of records, decoded per record either by
+// slicing a Data per record or in place via UnsafeRawBufferPointer.
+var blockRanges: [Range<Int>] = []
+blockRanges.reserveCapacity(count)
+var block: [UInt8] = []
+for u in users {
+    let s = block.count
+    try newEnc.encode(u, into: &block)
+    blockRanges.append(s ..< block.count)
+}
+let blockData = Data(block)
+let decDataSlices = try measure { var a = 0; for r in blockRanges {
+    a &+= try newDec.decode(HarnessUser.self, from: blockData.subdata(in: r)).id
+}; return a }
+let decBufferSlices = try block.withUnsafeBytes { raw in
+    try measure { var a = 0; for r in blockRanges {
+        a &+= try newDec.decode(HarnessUser.self, from: UnsafeRawBufferPointer(rebasing: raw[r])).id
+    }; return a }
+}
+
+print("## Zero-copy batch APIs (current, \(count) docs)\n")
+print("| Operation | Data per record (µs/op) | zero-copy (µs/op) | speedup |")
+print("|-----------|------------------------:|------------------:|--------:|")
+print("| encode -> Data vs encode(into: reused buffer) | \(fmtNs(encPerDoc, ops: count)) | \(fmtNs(encIntoBatch, ops: count)) | \(String(format: "%.2fx", encPerDoc / encIntoBatch)) |")
+print("| decode Data-slice vs decode(from: bytes) | \(fmtNs(decDataSlices, ops: count)) | \(fmtNs(decBufferSlices, ops: count)) | \(String(format: "%.2fx", decDataSlices / decBufferSlices)) |")

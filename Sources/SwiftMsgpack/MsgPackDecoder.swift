@@ -55,56 +55,73 @@ open class MsgPackDecoder {
 
     open func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         try data.withUnsafeBytes { rawBuffer in
-            let value: MsgPackValue
-            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
-                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
-                value = scanRoot(scanner)
-                if scanner.corrupt {
-                    throw DecodingError.dataCorrupted(.init(
-                        codingPath: [],
-                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
-                    ))
-                }
-            } else {
-                value = .none
+            try decodeCore(type, base: rawBuffer.baseAddress, count: rawBuffer.count, source: data) {
+                try $0.unwrap(as: T.self)
             }
-            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
-            do {
-                return try decoder.unwrap(as: T.self)
-            } catch {
-                if let error = error as? MsgPackDecodingError {
-                    throw error.asDecodingError(type, codingPath: [])
-                }
-                throw error
-            }
+        }
+    }
+
+    /// Decodes a value directly from a raw byte buffer, without wrapping it
+    /// in `Data`. Intended for batch consumers that read many records into
+    /// one contiguous block and decode each record in place from a rebased
+    /// slice of that block.
+    ///
+    /// - Important: `buffer` must stay valid for the duration of the call.
+    ///   Nothing derived from it is retained past the return: a decoded
+    ///   `MsgPackRawValue`/`Data` field copies its bytes out.
+    open func decode<T: Decodable>(_ type: T.Type, from buffer: UnsafeRawBufferPointer) throws -> T {
+        try decodeCore(type, base: buffer.baseAddress, count: buffer.count, source: borrowedData(buffer)) {
+            try $0.unwrap(as: T.self)
         }
     }
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from data: Data, configuration: T.DecodingConfiguration) throws -> T {
         try data.withUnsafeBytes { rawBuffer in
-            let value: MsgPackValue
-            if let base = rawBuffer.baseAddress, !rawBuffer.isEmpty {
-                let scanner: MsgPackScanner = .init(source: data, ptr: base, count: rawBuffer.count)
-                value = scanRoot(scanner)
-                if scanner.corrupt {
-                    throw DecodingError.dataCorrupted(.init(
-                        codingPath: [],
-                        debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
-                    ))
-                }
-            } else {
-                value = .none
+            try decodeCore(type, base: rawBuffer.baseAddress, count: rawBuffer.count, source: data) {
+                try $0.unwrap(as: T.self, configuration: configuration)
             }
-            let decoder: _MsgPackDecoder = .init(from: value, sourceData: data, userInfo: userInfo)
-            do {
-                return try decoder.unwrap(as: T.self, configuration: configuration)
-            } catch {
-                if let error = error as? MsgPackDecodingError {
-                    throw error.asDecodingError(type, codingPath: [])
-                }
-                throw error
+        }
+    }
+
+    /// Buffer-based variant of ``decode(_:from:configuration:)``. See
+    /// ``decode(_:from:)-swift.method`` for the lifetime contract.
+    @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+    open func decode<T: DecodableWithConfiguration>(_ type: T.Type, from buffer: UnsafeRawBufferPointer, configuration: T.DecodingConfiguration) throws -> T {
+        try decodeCore(type, base: buffer.baseAddress, count: buffer.count, source: borrowedData(buffer)) {
+            try $0.unwrap(as: T.self, configuration: configuration)
+        }
+    }
+
+    /// A no-copy `Data` view of `buffer`, used only as the slicing source for
+    /// `MsgPackRawValue` fields. It never outlives the decode call.
+    private func borrowedData(_ buffer: UnsafeRawBufferPointer) -> Data {
+        guard let base = buffer.baseAddress, !buffer.isEmpty else { return Data() }
+        return Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: buffer.count, deallocator: .none)
+    }
+
+    private func decodeCore<T>(_ type: T.Type, base: UnsafeRawPointer?, count: Int, source: Data, _ unwrap: (_MsgPackDecoder) throws -> T) throws -> T {
+        let value: MsgPackValue
+        if let base, count > 0 {
+            let scanner: MsgPackScanner = .init(ptr: base, count: count)
+            value = scanRoot(scanner)
+            if scanner.corrupt {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [],
+                    debugDescription: "The given data is not valid MessagePack: truncated or malformed input."
+                ))
             }
+        } else {
+            value = .none
+        }
+        let decoder: _MsgPackDecoder = .init(from: value, sourceData: source, userInfo: userInfo)
+        do {
+            return try unwrap(decoder)
+        } catch {
+            if let error = error as? MsgPackDecodingError {
+                throw error.asDecodingError(type, codingPath: [])
+            }
+            throw error
         }
     }
 

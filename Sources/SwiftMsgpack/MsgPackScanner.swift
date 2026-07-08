@@ -222,15 +222,13 @@ enum MsgPackOpCode {
 class MsgPackScanner {
     private static let maxNestingDepth = 512
 
-    private let source: Data
     private let start: UnsafeRawPointer
     private var ptr: UnsafeRawPointer
     private let count: Int
     private var depth = 0
     private(set) var corrupt = false
 
-    init(source: Data, ptr: UnsafeRawPointer, count: Int) {
-        self.source = source
+    init(ptr: UnsafeRawPointer, count: Int) {
         start = ptr
         self.ptr = ptr
         self.count = count

@@ -38,6 +38,28 @@ open class MsgPackEncoder {
         return buffer.finish()
     }
 
+    /// Appends the MessagePack encoding of `value` to `out`, without
+    /// allocating an intermediate `Data` per call. Intended for batch
+    /// producers that concatenate many records into one contiguous buffer.
+    ///
+    /// On error `out` is left exactly as it was. The buffer is taken over by
+    /// value-swap (no copy), so passing the same array across calls reuses
+    /// its capacity.
+    open func encode<T: Encodable>(_ value: T, into out: inout [UInt8]) throws {
+        let buffer = MsgPackWriteBuffer(taking: &out)
+        defer { buffer.release(into: &out) }
+        let start = buffer.count
+        do {
+            try buffer.writeValue(value, options: options, userInfo: userInfo, codingPath: [], additionalKey: nil)
+        } catch {
+            buffer.truncate(to: start)
+            throw error
+        }
+        if buffer.count == start {
+            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
+        }
+    }
+
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func encode<T: EncodableWithConfiguration>(_ value: T, configuration: T.EncodingConfiguration) throws -> Data {
         let buffer = MsgPackWriteBuffer()
@@ -76,11 +98,28 @@ final class MsgPackWriteBuffer {
         bytes.reserveCapacity(minimumCapacity)
     }
 
+    /// Takes over the caller's buffer by swap (no copy); pair with
+    /// `release(into:)` to hand it back.
+    init(taking out: inout [UInt8]) {
+        bytes = []
+        swap(&bytes, &out)
+    }
+
     var count: Int { bytes.count }
 
     func finish() -> Data {
         reusableEncoder = nil
         return Data(bytes)
+    }
+
+    func truncate(to n: Int) {
+        bytes.removeLast(bytes.count - n)
+        openHeaders.removeAll()
+    }
+
+    func release(into out: inout [UInt8]) {
+        reusableEncoder = nil
+        swap(&bytes, &out)
     }
 
     // MARK: primitive writes
