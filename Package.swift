@@ -20,6 +20,18 @@ let package = Package(
             name: "SwiftMsgpack",
             dependencies: []
         ),
+        .target(
+            name: "MsgpackBaselineV1",
+            dependencies: []
+        ),
+        .executableTarget(
+            name: "bench",
+            dependencies: [
+                "SwiftMsgpack",
+                "MsgpackBaselineV1",
+            ],
+            path: "Benchmarks"
+        ),
         .executableTarget(
             name: "example",
             dependencies: [
@@ -29,7 +41,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftMsgpackTests",
-            dependencies: ["SwiftMsgpack"]
+            dependencies: ["SwiftMsgpack", "MsgpackBaselineV1"]
         ),
     ]
 )
