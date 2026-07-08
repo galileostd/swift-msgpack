@@ -139,7 +139,12 @@ public protocol MsgPackDecodable: Decodable {
 public typealias MsgPackCodable = MsgPackDecodable & MsgPackEncodable
 
 class _MsgPackDecoder: Decoder {
-    var codingPath: [CodingKey]
+    /// The coding path is `basePath` + `tail`, materialised only when
+    /// something actually reads `codingPath` (error contexts, custom
+    /// decoders) — creating a sub-decoder per field never allocates it.
+    let basePath: [CodingKey]
+    let tail: MsgPackPathTail
+    var codingPath: [CodingKey] { tail.appended(to: basePath) }
     var value: MsgPackValue
     let sourceData: Data
     var userInfo: [CodingUserInfoKey: Any]
@@ -148,11 +153,12 @@ class _MsgPackDecoder: Decoder {
         value.rawData(from: sourceData)
     }
 
-    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = []) {
+    init(from value: MsgPackValue, sourceData: Data, userInfo: [CodingUserInfoKey: Any] = [:], at codingPath: [CodingKey] = [], tail: MsgPackPathTail = .none) {
         self.sourceData = sourceData
         self.userInfo = userInfo
         self.value = value
-        self.codingPath = codingPath
+        basePath = codingPath
+        self.tail = tail
     }
 
     func container<Key>(keyedBy _: Key.Type) throws -> KeyedDecodingContainer<Key> where Key: CodingKey {
@@ -181,7 +187,7 @@ class _MsgPackDecoder: Decoder {
     }
 
     func singleValueContainer() throws -> SingleValueDecodingContainer {
-        _MsgPackSingleValueDecodingContainer(decoder: self, codingPath: codingPath, value: value)
+        _MsgPackSingleValueDecodingContainer(decoder: self, value: value)
     }
 }
 
@@ -426,12 +432,13 @@ extension _MsgPackDecoder {
 
 private struct _MsgPackSingleValueDecodingContainer: SingleValueDecodingContainer {
     let decoder: _MsgPackDecoder
-    let codingPath: [CodingKey]
     let value: MsgPackValue
+    /// Computed on demand — sub-decoders never mutate their path, and the
+    /// container only reads it on error exits.
+    var codingPath: [CodingKey] { decoder.codingPath }
 
-    init(decoder: _MsgPackDecoder, codingPath: [CodingKey], value: MsgPackValue) {
+    init(decoder: _MsgPackDecoder, value: MsgPackValue) {
         self.decoder = decoder
-        self.codingPath = codingPath
         self.value = value
     }
 
@@ -535,13 +542,15 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 
     private let decoder: _MsgPackDecoder
-    private(set) var codingPath: [CodingKey]
     public private(set) var currentIndex: Int
     private var source: Source
 
+    /// Computed on demand — the decoder's path is immutable, and the
+    /// container reads it only on error exits and sub-decoder creation.
+    var codingPath: [CodingKey] { decoder.codingPath }
+
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
         self.decoder = decoder
-        codingPath = decoder.codingPath
         currentIndex = 0
         if case let .lazyArray(c) = container.kind {
             source = .lazy(c)
@@ -673,8 +682,7 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 
     private mutating func decoderForNextElement<T>(ofType _: T.Type) throws -> _MsgPackDecoder {
         let value = try getNextValue(ofType: T.self)
-        let newPath = codingPath + [MsgPackKey(index: currentIndex)]
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: codingPath, tail: .index(currentIndex))
     }
 
     @inline(__always)
@@ -845,8 +853,11 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     }
 
     private let decoder: _MsgPackDecoder
-    private(set) var codingPath: [CodingKey]
     private var source: Source
+
+    /// Computed on demand — the decoder's path is immutable, and the
+    /// container reads it only on error exits and sub-decoder creation.
+    var codingPath: [CodingKey] { decoder.codingPath }
 
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
         self.decoder = decoder
@@ -855,7 +866,6 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
         } else {
             source = .eager(EagerMapCursor(container: container))
         }
-        codingPath = decoder.codingPath
     }
 
     var allKeys: [Key] {
@@ -972,8 +982,7 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
 
     private func decoderForKey<LocalKey: CodingKey>(_ key: LocalKey) throws -> _MsgPackDecoder {
         let value = try getValue(forKey: key)
-        let newPath: [CodingKey] = codingPath + [key]
-        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: newPath)
+        return _MsgPackDecoder(from: value, sourceData: decoder.sourceData, userInfo: decoder.userInfo, at: codingPath, tail: .key(key))
     }
 
     @inline(__always)

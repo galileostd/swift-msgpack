@@ -207,6 +207,7 @@ for u in users {
     try newEnc.encode(u, into: &block)
     blockRanges.append(s ..< block.count)
 }
+
 let blockData = Data(block)
 let decDataSlices = try measure { var a = 0; for r in blockRanges {
     a &+= try newDec.decode(HarnessUser.self, from: blockData.subdata(in: r)).id
