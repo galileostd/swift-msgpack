@@ -34,11 +34,6 @@ extension MsgPackValueLiteralType {
     }
 }
 
-struct MsgPackStringKey {
-    let stringValue: String
-    let msgPackValue: MsgPackEncodedValue
-}
-
 enum MsgPackValue {
     case none
     case literal(MsgPackValueLiteralType)
@@ -154,93 +149,6 @@ extension MsgPackValue {
             return "an array"
         case .map, .lazyMap:
             return "a map"
-        }
-    }
-}
-
-extension MsgPackValue {
-    struct Writer {
-        func writeValue(_ value: MsgPackEncodedValue) -> [UInt8] {
-            var bytes: [UInt8] = .init()
-            bytes.reserveCapacity(byteSize(of: value))
-            writeValue(value, into: &bytes)
-            return bytes
-        }
-
-        private func containerHeaderSize(_ n: Int) -> Int {
-            if n <= UInt.maxUint4 {
-                return 1
-            }
-            if n <= UInt16.max {
-                return 3
-            }
-            return 5
-        }
-
-        private func byteSize(of value: MsgPackEncodedValue) -> Int {
-            switch value {
-            case .none:
-                return 0
-            case let .literal(data):
-                return data.count
-            case let .ext(_, data):
-                return data.count
-            case let .array(array):
-                var size = containerHeaderSize(array.count)
-                for item in array {
-                    size += byteSize(of: item)
-                }
-                return size
-            case let .map(a):
-                var size = containerHeaderSize(a.count / 2)
-                for item in a {
-                    size += byteSize(of: item)
-                }
-                return size
-            }
-        }
-
-        private func writeValue(_ value: MsgPackEncodedValue, into bytes: inout [UInt8]) {
-            switch value {
-            case let .literal(data):
-                bytes.append(contentsOf: data)
-            case let .ext(_, data):
-                bytes.append(contentsOf: data)
-            case let .array(array):
-                let n = array.count
-                if n <= UInt.maxUint4 {
-                    bytes.append(UInt8(0x90 + n))
-                } else if n <= UInt16.max {
-                    bytes.append(0xDC)
-                    UInt16(n).appendBigEndian(to: &bytes)
-                } else {
-                    bytes.append(0xDD)
-                    UInt32(n).appendBigEndian(to: &bytes)
-                }
-                for item in array {
-                    writeValue(item, into: &bytes)
-                }
-            case let .map(a):
-                let n = a.count / 2
-                if n <= UInt.maxUint4 {
-                    bytes.append(UInt8(0x80 + n))
-                } else if n <= UInt16.max {
-                    bytes.append(0xDE)
-                    UInt16(n).appendBigEndian(to: &bytes)
-                } else {
-                    bytes.append(0xDF)
-                    UInt32(n).appendBigEndian(to: &bytes)
-                }
-
-                for i in 0 ..< n {
-                    let key = a[i * 2]
-                    let value = a[i * 2 + 1]
-                    writeValue(key, into: &bytes)
-                    writeValue(value, into: &bytes)
-                }
-            case .none:
-                break
-            }
         }
     }
 }
