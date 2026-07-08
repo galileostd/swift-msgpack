@@ -46,7 +46,6 @@ final class LazyMapCursor {
 
     private let pairPositions: [UnsafeRawPointer]
     private var pairs: [(MsgPackValue, MsgPackValue)]
-    private var stringIndex: [String: Int]
     private(set) var consumedPairs: Int
 
     init(scanner: MsgPackScanner, start: UnsafeRawPointer, pairCount: Int, positions: [UnsafeRawPointer]) {
@@ -56,36 +55,46 @@ final class LazyMapCursor {
         pairPositions = positions
         pairs = []
         pairs.reserveCapacity(pairCount)
-        stringIndex = [:]
-        stringIndex.reserveCapacity(pairCount)
         consumedPairs = 0
     }
 
-    private func consumeNext() -> (MsgPackValue, MsgPackValue, String?) {
+    /// Consumes the next unvisited pair, caching it. The key is materialised
+    /// without the `.raw` wrapper (it is only ever byte-compared, never
+    /// re-serialised), so no allocation happens for keys.
+    private func consumeNext() {
         let i = consumedPairs
         scanner.seek(to: pairPositions[i])
-        let k = scanner.scanLazy()
+        let k = scanner.scanLazyInner()
         let v = scanner.scanLazy()
         consumedPairs += 1
         pairs.append((k, v))
-        var keyString: String?
-        if case let .literal(.str(buf)) = k.stripped, let s = String._tryFromUTF8(buf) {
-            if stringIndex[s] == nil {
-                stringIndex[s] = pairs.count - 1
-            }
-            keyString = s
+    }
+
+    /// Compares a cached map key against the requested Swift key by raw UTF-8
+    /// bytes — no `String` is allocated for the on-wire key.
+    private func keyMatches(_ key: MsgPackValue, _ wanted: String) -> Bool {
+        guard case let .literal(.str(buf)) = key.stripped else { return false }
+        var it = wanted.utf8.makeIterator()
+        var i = 0
+        while let b = it.next() {
+            if i >= buf.count || buf[i] != b { return false }
+            i += 1
         }
-        return (k, v, keyString)
+        return i == buf.count
     }
 
     func value(forStringKey key: String) -> MsgPackValue? {
-        if let idx = stringIndex[key] {
-            return pairs[idx].1
+        // 1. Already-consumed pairs (byte-compare, no walk, no allocation).
+        for i in 0 ..< consumedPairs where keyMatches(pairs[i].0, key) {
+            return pairs[i].1
         }
+        // 2. Walk forward from the sequential cursor until the key is found.
+        //    For declaration-order decoding this consumes exactly one pair.
         while consumedPairs < pairCount {
-            let (_, v, keyString) = consumeNext()
-            if keyString == key {
-                return v
+            consumeNext()
+            let pair = pairs[consumedPairs - 1]
+            if keyMatches(pair.0, key) {
+                return pair.1
             }
         }
         return nil
@@ -93,7 +102,7 @@ final class LazyMapCursor {
 
     func entries() -> [MsgPackValue] {
         while consumedPairs < pairCount {
-            _ = consumeNext()
+            consumeNext()
         }
         var arr: [MsgPackValue] = []
         arr.reserveCapacity(pairCount * 2)
@@ -106,9 +115,16 @@ final class LazyMapCursor {
 
     func allStringKeys() -> [String] {
         while consumedPairs < pairCount {
-            _ = consumeNext()
+            consumeNext()
         }
-        return Array(stringIndex.keys)
+        var keys: [String] = []
+        keys.reserveCapacity(pairs.count)
+        for (k, _) in pairs {
+            if case let .literal(.str(buf)) = k.stripped, let s = String._tryFromUTF8(buf) {
+                keys.append(s)
+            }
+        }
+        return keys
     }
 
     func contains(stringKey key: String) -> Bool {
