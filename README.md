@@ -141,6 +141,126 @@ Add the following to your Podfile:
 ```terminal
 pod 'SwiftMessagePack'
 ```
+## Benchmarks
+
+This fork tracks encoder/decoder performance for the NyaruDB2 database engine.
+The `bench` executable target measures the coder pair against the frozen
+`v1.3.0` baseline (vendored in `Sources/MsgpackBaselineV1`) and Foundation
+JSON as an external yardstick.
+
+Run it with:
+
+```terminal
+swift run -c release bench
+```
+
+The reference shape mirrors NyaruDB2's harness document:
+
+```swift
+struct HarnessUser: Codable {
+    let id: Int
+    let name: String        // ~12 chars
+    let email: String       // ~20 chars
+    let age: Int
+    let city: String        // ~8 chars, 10 distinct values
+    let createdAt: Date
+    let tags: [String]      // 0–3 short strings
+}
+```
+
+**Ship gate (NyaruDB2 roadmap):** a change to the coders merges only if it is
+≥1.5× faster on decode **or** ≥1.3× faster on encode versus `v1.3.0` on the
+reference shape, with the compatibility/robustness suite green.
+
+### Results — full optimization pass (10,000 docs, best-of-15, Apple Silicon, Swift 6.2.4)
+
+Reference shape `HarnessUser`, `current` vs frozen `v1.3.0`:
+
+| Operation | v1.3.0 (µs/op) | current (µs/op) | Foundation JSON (µs/op) | current vs v1.3.0 |
+|-----------|---------------:|----------------:|------------------------:|------------------:|
+| encode            | 4.619 | 2.297 | 2.971 | **2.01×** |
+| decode (eager)    | 2.828 | 1.855 | 2.866 | **1.52×** |
+| decode (lazyScan) | 3.166 | 2.221 | 2.866 | **1.43×** |
+
+Avg payload: msgpack 115.8 B, JSON 145.0 B (byte-identical to v1.3.0 — headers
+stay minimal). Both gates cleared: encode ≥1.3× **and** eager decode ≥1.5×.
+Every row also beats Foundation JSON.
+
+String-heavy variant (5 strings): encode **2.34×** (2.35 → 1.00 µs/op), decode
+eager **1.69×** (1.34 → 0.79 µs/op). Scalar-only 7×`Int` struct on lazyScan:
+**1.87×** (1.68 → 0.90 µs/op).
+
+What landed, in order:
+
+1. **Streaming encoder (`MsgPackWriteBuffer`).** The old path built a full
+   `MsgPackEncodedValue` tree per document and walked it twice (`byteSize`
+   then `writeValue`); the encoder now writes MessagePack directly into one
+   growable buffer. Minimal size-class headers are preserved (byte-identical
+   output) via in-place count patching, growing a header with a one-time
+   `memmove` only when a container crosses 16 or 65536 entries. Zero heap
+   allocations per leaf field; one `_MsgPackEncoder` instance is reused for
+   every nested value.
+2. **Span-carrying `MsgPackValue` struct.** The scanned IR was an enum whose
+   `indirect case raw(from:count:_)` boxed *every* value on the heap to
+   remember its byte span (~20 boxes per document). It is now a struct
+   `{ kind, from, count }` — the span travels inline and building the tree
+   allocates only the container arrays.
+3. **Byte-compared map keys on both decode paths.** Neither the lazy
+   (`LazyMapCursor`) nor the eager (`EagerMapCursor`) keyed container
+   allocates a `String` per on-wire key or builds a key dictionary up front:
+   keys are matched by raw UTF-8 comparison against a sequential cursor
+   (declaration-order decoding matches immediately). The eager cursor builds
+   a keep-first `String` index once if lookups go out of order, so large or
+   adversarial maps keep O(1) behaviour.
+4. **Lazily materialised coding paths.** Nested values carried
+   `codingPath + [key]` arrays (and "Index N" keys) built eagerly on every
+   dispatch; paths are now `(basePath, tail)` pairs appended only when an
+   error context or a `codingPath` read actually needs them. Error payloads
+   are unchanged.
+5. **Zero-copy batch APIs** for NyaruDB2's batch paths:
+   `encode(_:into: inout [UInt8])` appends to a caller-supplied buffer
+   (capacity reused across calls, buffer untouched on error) and
+   `decode(_:from: UnsafeRawBufferPointer)` decodes a record in place from a
+   rebased slice of a coalesced read — no `Data` per record in either
+   direction (~1.05× in isolation; the point is removing per-record
+   allocations inside `appendBatch`/`readBatch` loops).
+
+Compatibility is guarded by the cross-version suite (golden v1.3.0 fixtures,
+live round-trips in both directions, map-key declaration order) plus the
+robustness suite — all green.
+
+### §3 Date-cost probe (single-field structs, v1.3.0)
+
+| Field | encode (µs/op) | decode (µs/op) | payload (B) |
+|-------|---------------:|---------------:|------------:|
+| Date  | 1.188 | 0.767 | 20 |
+| Int   | 0.775 | 0.546 | 8 |
+
+`Date` costs only ~1.4× an `Int` (not 10–50×). `Date` encodes as a plain
+`float64` (9-byte value) via standard `Codable`, **not** the msgpack timestamp
+extension — there is no per-call `Data` packing to eliminate, and any fast path
+would change the wire format. **Verdict: no Date fast path; §3 is a measurement,
+not an optimization target.**
+
+### What was measured and rejected
+
+- **Unsafe manual write buffer** (replacing `[UInt8]` appends with
+  uninitialized-capacity writes): encode already clears its gate at 2.01× and
+  beats JSON; the remaining append bounds checks are worth ~10–20% at best,
+  and a manual buffer breaks the zero-copy `encode(into:)` array-swap
+  contract. Not worth the memory-safety risk.
+- **`withUTF8` + `memcmp` key comparison**: measured *slower* than a plain
+  byte loop for typical short keys (the `withUTF8` setup dominates); the byte
+  loop stayed.
+- **Date fast path** (§3 above): wire-format change, no real cost to remove.
+
+**Consequence for NyaruDB2:** both ship gates are met (encode 2.01×, decode
+1.52×), and the coders now sit at the `String`-allocation floor that bounds
+every Codable decoder. The next lever for the Query gap is reading/decoding
+*fewer* bytes and *fewer* fields (roadmap P1.1 coalesced reads and P1.6
+projections) — wire those to `decode(_:from: UnsafeRawBufferPointer)` and
+`encode(_:into:)` from this pass.
+
 ## License
 
 swift-msgpack is published under the MIT License. See the LICENSE file for details.

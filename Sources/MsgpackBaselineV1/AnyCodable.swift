@@ -147,7 +147,7 @@ extension AnyCodable: Decodable {
     }
 
     private static func _fromMsgPackValue(_ value: MsgPackValue) throws -> AnyCodable {
-        switch value.kind {
+        switch value.stripped {
         case .literal(.nil):
             return AnyCodable(Self?.none)
         case let .literal(.bool(v)):
@@ -179,7 +179,7 @@ extension AnyCodable: Decodable {
         case .array, .lazyArray:
             let arr = try _decodeArray(from: value)
             return AnyCodable(arr)
-        case .ext, .none:
+        case .ext, .none, .raw:
             throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "AnyCodable cannot decode extension or raw value"))
         }
     }

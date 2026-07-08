@@ -4,6 +4,11 @@ private protocol _MsgPackDictionaryEncodableMarker {}
 
 extension Dictionary: _MsgPackDictionaryEncodableMarker where Key: Encodable, Value: Encodable {}
 
+public protocol MsgPackEncodable: Encodable {
+    func encodeMsgPack() throws -> [UInt8]
+    var type: Int8 { get }
+}
+
 open class MsgPackEncoder {
     public struct OutputOption: OptionSet, Sendable {
         public let rawValue: UInt
@@ -24,978 +29,679 @@ open class MsgPackEncoder {
     }
 
     open func encode<T: Encodable>(_ value: T) throws -> Data {
-        let value: MsgPackEncodedValue = try encodeAsMsgPackValue(value)
-        let writer = MsgPackValue.Writer()
-        let bytes = writer.writeValue(value)
-        return Data(bytes)
+        let buffer = MsgPackWriteBuffer()
+        let start = buffer.count
+        try buffer.writeValue(value, options: options, userInfo: userInfo, codingPath: [], tail: .none)
+        if buffer.count == start {
+            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
+        }
+        return buffer.finish()
+    }
+
+    /// Appends the MessagePack encoding of `value` to `out`, without
+    /// allocating an intermediate `Data` per call. Intended for batch
+    /// producers that concatenate many records into one contiguous buffer.
+    ///
+    /// On error `out` is left exactly as it was. The buffer is taken over by
+    /// value-swap (no copy), so passing the same array across calls reuses
+    /// its capacity.
+    open func encode<T: Encodable>(_ value: T, into out: inout [UInt8]) throws {
+        let buffer = MsgPackWriteBuffer(taking: &out)
+        defer { buffer.release(into: &out) }
+        let start = buffer.count
+        do {
+            try buffer.writeValue(value, options: options, userInfo: userInfo, codingPath: [], tail: .none)
+        } catch {
+            buffer.truncate(to: start)
+            throw error
+        }
+        if buffer.count == start {
+            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
+        }
     }
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func encode<T: EncodableWithConfiguration>(_ value: T, configuration: T.EncodingConfiguration) throws -> Data {
-        let value: MsgPackEncodedValue = try encodeAsMsgPackValue(value, configuration: configuration)
-        let writer = MsgPackValue.Writer()
-        let bytes = writer.writeValue(value)
-        return Data(bytes)
+        let buffer = MsgPackWriteBuffer()
+        let start = buffer.count
+        try buffer.writeValue(value, configuration: configuration, options: options, userInfo: userInfo, codingPath: [], tail: .none)
+        if buffer.count == start {
+            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
+        }
+        return buffer.finish()
     }
 
     @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
     open func encode<T, C>(_ value: T, configuration: C.Type) throws -> Data where T: EncodableWithConfiguration, C: EncodingConfigurationProviding, T.EncodingConfiguration == C.EncodingConfiguration {
         try encode(value, configuration: C.encodingConfiguration)
     }
-
-    func encodeAsMsgPackValue<T: Encodable>(_ value: T) throws -> MsgPackEncodedValue {
-        let encoder = _MsgPackEncoder(codingPath: [], options: options, userInfo: userInfo)
-        guard let result = try encoder.wrapEncodable(value, for: CodingKey?.none) else {
-            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
-        }
-        return result
-    }
-
-    func encodeAsMsgPackValue<T: EncodableWithConfiguration>(_ value: T, configuration: T.EncodingConfiguration) throws -> MsgPackEncodedValue {
-        let encoder = _MsgPackEncoder(codingPath: [], options: options)
-        guard let result = try encoder.wrapEncodable(value, configuration: configuration, for: CodingKey?.none) else {
-            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
-        }
-        return result
-    }
 }
 
-enum MsgPackEncodedValue {
-    case none
-    case literal([UInt8])
-    case ext(Int8, [UInt8])
-    case array([MsgPackEncodedValue])
-    case map([MsgPackEncodedValue])
+// MARK: - Streaming write buffer
 
-    static let Nil = literal([0xC0])
+/// A single growable contiguous byte buffer that the encoder writes MessagePack
+/// directly into — no intermediate value tree. Container headers use the
+/// minimal MessagePack size class; when a container crosses a size-class
+/// boundary (16 or 65536 entries) the header is grown in place with a one-time
+/// `memmove` and all still-open container header offsets are fixed up.
+final class MsgPackWriteBuffer {
+    private(set) var bytes: [UInt8]
+    private var openHeaders: [ContainerHeader] = []
+    /// A single encoder instance reused for every nested value within one
+    /// top-level encode call. Safe because Codable encoding is strictly
+    /// depth-first and synchronous, and every `writeValue` resets the
+    /// encoder's `codingPath`/`mapHint` before handing it to `encode(to:)`.
+    private var reusableEncoder: _MsgPackEncoder?
 
-    var debugDataTypeDescription: String {
-        switch self {
-        case .none: return "nil"
-        case .literal: return "literal"
-        case .ext: return "ext"
-        case .array: return "array"
-        case .map: return "map"
-        }
-    }
-}
-
-extension MsgPackEncodedValue {
-    func asMap() -> MsgPackEncodedValue {
-        switch self {
-        case .none, .literal, .ext:
-            return .map([])
-        case let .array(a):
-            if a.count % 2 != 0 {
-                return .map([])
-            }
-            return .map(a)
-        case .map:
-            return self
-        }
-    }
-}
-
-public protocol MsgPackEncodable: Encodable {
-    func encodeMsgPack() throws -> [UInt8]
-    var type: Int8 { get }
-}
-
-private class _MsgPackEncoder: Encoder {
-    public var codingPath: [CodingKey] = []
-    public var userInfo: [CodingUserInfoKey: Any] = [:]
-    fileprivate let options: MsgPackEncoder.OutputOption
-
-    init(codingPath: [CodingKey] = [], options: MsgPackEncoder.OutputOption, userInfo: [CodingUserInfoKey: Any] = [:]) {
-        self.codingPath = codingPath
-        self.options = options
-        self.userInfo = userInfo
+    init(minimumCapacity: Int = 256) {
+        bytes = []
+        bytes.reserveCapacity(minimumCapacity)
     }
 
-    var singleValue: MsgPackEncodedValue?
-    var array: MsgPackFuture.RefArray?
-    var map: MsgPackFuture.RefMap?
-    var value: MsgPackEncodedValue? {
-        if let array: MsgPackFuture.RefArray = array {
-            return .array(array.values)
-        }
-        if let map: MsgPackFuture.RefMap = map {
-            var a: [MsgPackEncodedValue] = []
-            let values = map.values
-            a.reserveCapacity(values.count * 2)
-            for (k, v) in values {
-                a.append(k)
-                a.append(v)
-            }
-            return .map(a)
-        }
-        return singleValue
+    /// Takes over the caller's buffer by swap (no copy); pair with
+    /// `release(into:)` to hand it back.
+    init(taking out: inout [UInt8]) {
+        bytes = []
+        swap(&bytes, &out)
     }
 
-    public func container<Key>(keyedBy _: Key.Type) -> KeyedEncodingContainer<Key> where Key: CodingKey {
-        if map != nil {
-            return KeyedEncodingContainer(MsgPackKeyedEncodingContainer(referencing: self, codingPath: codingPath))
-        }
-        map = .init()
-        return KeyedEncodingContainer(MsgPackKeyedEncodingContainer(referencing: self, codingPath: codingPath))
+    var count: Int { bytes.count }
+
+    func finish() -> Data {
+        reusableEncoder = nil
+        return Data(bytes)
     }
 
-    public func unkeyedContainer() -> UnkeyedEncodingContainer {
-        if array != nil {
-            return MsgPackUnkeyedEncodingContainer(referencing: self, codingPath: codingPath)
-        }
-        array = .init()
-        return MsgPackUnkeyedEncodingContainer(referencing: self, codingPath: codingPath)
+    func truncate(to n: Int) {
+        bytes.removeLast(bytes.count - n)
+        openHeaders.removeAll()
     }
 
-    public func singleValueContainer() -> SingleValueEncodingContainer {
-        MsgPackSingleValueEncodingContainer(encoder: self, codingPath: codingPath)
+    func release(into out: inout [UInt8]) {
+        reusableEncoder = nil
+        swap(&bytes, &out)
     }
-}
 
-extension _MsgPackEncoder: _SpecialTreatmentEncoder {
-    var encoder: _MsgPackEncoder {
-        self
+    // MARK: primitive writes
+
+    @inline(__always) func writeByte(_ b: UInt8) { bytes.append(b) }
+
+    @inline(__always) func writeRawBytes<S: Sequence>(_ s: S) where S.Element == UInt8 {
+        bytes.append(contentsOf: s)
     }
-}
 
-private enum MsgPackFuture {
-    case value(MsgPackEncodedValue)
-    case encoder(_MsgPackEncoder)
-    case nestedArray(RefArray)
-    case nestedMap(RefMap)
+    @inline(__always) private func appendBE<T: FixedWidthInteger>(_ v: T) {
+        withUnsafeBytes(of: v.bigEndian) { bytes.append(contentsOf: $0) }
+    }
 
-    class RefArray {
-        private(set) var array: [MsgPackFuture] = []
-
-        init() {
-            array.reserveCapacity(10)
-        }
-
-        @inline(__always)
-        func append(_ element: MsgPackEncodedValue) {
-            array.append(.value(element))
-        }
-
-        @inline(__always)
-        func append(_ encoder: _MsgPackEncoder) {
-            array.append(.encoder(encoder))
-        }
-
-        @inline(__always)
-        func appendArray() -> RefArray {
-            let array = RefArray()
-            self.array.append(.nestedArray(array))
-            return array
-        }
-
-        @inline(__always)
-        func appendMap() -> RefMap {
-            let map = RefMap()
-            array.append(.nestedMap(map))
-            return map
-        }
-
-        var values: [MsgPackEncodedValue] {
-            array.compactMap { future in
-                switch future {
-                case let .value(value):
-                    return value
-                case let .nestedArray(array):
-                    return .array(array.values)
-                case let .nestedMap(map):
-                    let values = map.values
-                    let n = values.count
-                    var a: [MsgPackEncodedValue] = []
-                    a.reserveCapacity(n * 2)
-                    for (k, v) in values {
-                        a.append(k)
-                        a.append(v)
-                    }
-                    return .map(a)
-                case let .encoder(encoder):
-                    return encoder.value
-                }
+    @inline(__always) private func patchBE<T: FixedWidthInteger>(_ v: T, at index: Int) {
+        var i = index
+        withUnsafeBytes(of: v.bigEndian) { raw in
+            for b in raw {
+                bytes[i] = b
+                i += 1
             }
         }
     }
 
-    class RefMap {
-        private(set) var keys: [MsgPackStringKey] = []
-        private(set) var dict: [String: MsgPackFuture] = [:]
-        init() {
-            dict.reserveCapacity(20)
-        }
+    // MARK: leaf encoders (byte formats identical to v1.3.0)
 
-        @inline(__always)
-        func set(_ value: MsgPackEncodedValue, for key: MsgPackStringKey) {
-            if dict[key.stringValue] == nil {
-                keys.append(key)
-            }
-            dict[key.stringValue] = .value(value)
-        }
+    func writeNil() { bytes.append(0xC0) }
 
-        @inline(__always)
-        func setArray(for key: MsgPackStringKey) -> RefArray {
-            switch dict[key.stringValue] {
-            case let .nestedArray(array):
-                return array
-            case .value:
-                let array: MsgPackFuture.RefArray = .init()
-                dict[key.stringValue] = .nestedArray(array)
-                return array
-            case .none:
-                let array: MsgPackFuture.RefArray = .init()
-                dict[key.stringValue] = .nestedArray(array)
-                keys.append(key)
-                return array
-            case .nestedMap:
-                preconditionFailure("For key \"\(key)\" a keyed container has already been created.")
-            case .encoder:
-                preconditionFailure("For key \"\(key)\" an encoder has already been created.")
-            }
-        }
+    func writeBool(_ v: Bool) { bytes.append(v ? 0xC3 : 0xC2) }
 
-        @inline(__always)
-        func setMap(for key: MsgPackStringKey) -> RefMap {
-            switch dict[key.stringValue] {
-            case let .nestedMap(map):
-                return map
-            case .value:
-                let map: MsgPackFuture.RefMap = .init()
-                dict[key.stringValue] = .nestedMap(map)
-                return map
-            case .none:
-                let map: MsgPackFuture.RefMap = .init()
-                dict[key.stringValue] = .nestedMap(map)
-                keys.append(key)
-                return map
-            case .nestedArray:
-                preconditionFailure("For key \"\(key)\" a unkeyed container has already been created.")
-            case .encoder:
-                preconditionFailure("For key \"\(key)\" an encoder has already been created.")
-            }
-        }
-
-        @inline(__always)
-        func set(_ encoder: _MsgPackEncoder, for key: MsgPackStringKey) {
-            switch dict[key.stringValue] {
-            case .encoder:
-                preconditionFailure("For key \"\(key)\" an encoder has already been created.")
-            case .nestedMap:
-                preconditionFailure("For key \"\(key)\" a keyed container has already been created.")
-            case .nestedArray:
-                preconditionFailure("For key \"\(key)\" a unkeyed container has already been created.")
-            case .value:
-                dict[key.stringValue] = .encoder(encoder)
-            case .none:
-                dict[key.stringValue] = .encoder(encoder)
-                keys.append(key)
-            }
-        }
-
-        var values: [(MsgPackEncodedValue, MsgPackEncodedValue)] {
-            keys.compactMap {
-                switch dict[$0.stringValue] {
-                case let .value(value):
-                    return ($0.msgPackValue, value)
-                case let .nestedArray(array):
-                    return ($0.msgPackValue, .array(array.values))
-                case let .nestedMap(map):
-                    var a: [MsgPackEncodedValue] = []
-                    let values = map.values
-                    a.reserveCapacity(values.count * 2)
-                    for (k, v) in map.values {
-                        a.append(k)
-                        a.append(v)
-                    }
-                    return ($0.msgPackValue, .map(a))
-                case let .encoder(encoder):
-                    guard let value = encoder.value else {
-                        return nil
-                    }
-                    return ($0.msgPackValue, value)
-                case .none:
-                    return nil
-                }
-            }
-        }
-    }
-}
-
-private protocol _SpecialTreatmentEncoder {
-    var codingPath: [CodingKey] { get }
-    var encoder: _MsgPackEncoder { get }
-    var options: MsgPackEncoder.OutputOption { get }
-    var userInfo: [CodingUserInfoKey: Any] { get }
-}
-
-extension FixedWidthInteger {
-    func appendBigEndian(to buffer: inout [UInt8]) {
-        withUnsafeBytes(of: bigEndian) { ptr in
-            buffer.append(contentsOf: ptr)
-        }
-    }
-}
-
-private extension _SpecialTreatmentEncoder {
-    func wrapFloat<F: FloatingPoint & DataNumber>(_ value: F, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
-        var bits: [UInt8] = []
-        value.appendBytes(to: &bits)
-        if bits.count == 4 {
-            return .literal([0xCA] + bits)
-        }
-        if bits.count == 8 {
-            return .literal([0xCB] + bits)
-        }
-        let path: [CodingKey]
-        if let additionalKey = additionalKey {
-            path = codingPath + [additionalKey]
-        } else {
-            path = codingPath
-        }
-        throw EncodingError.invalidValue(value, .init(
-            codingPath: path,
-            debugDescription: "Unable to encode \(F.self).\(value) directly in MessagePack."
-        ))
+    func writeFloat(_ v: Float) {
+        bytes.append(0xCA)
+        appendBE(v.bitPattern)
     }
 
-    func wrapInt<T: SignedInteger & FixedWidthInteger>(_ value: T, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
+    func writeDouble(_ v: Double) {
+        bytes.append(0xCB)
+        appendBE(v.bitPattern)
+    }
+
+    func writeInt<T: SignedInteger & FixedWidthInteger>(_ value: T, codingPath: [CodingKey], additionalKey: CodingKey?) throws {
         if Int.fixMin <= value, value <= Int.fixMax {
-            var bytes: [UInt8] = []
-            Int8(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(UInt8(bitPattern: Int8(value)))
+            return
         }
         if Int8.min <= value, value <= Int8.max {
-            var bytes: [UInt8] = [0xD0]
-            Int8(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(0xD0)
+            bytes.append(UInt8(bitPattern: Int8(value)))
+            return
         }
         if Int16.min <= value, value <= Int16.max {
-            var bytes: [UInt8] = [0xD1]
-            Int16(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(0xD1)
+            appendBE(Int16(value))
+            return
         }
         if Int32.min <= value, value <= Int32.max {
-            var bytes: [UInt8] = [0xD2]
-            Int32(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(0xD2)
+            appendBE(Int32(value))
+            return
         }
         if Int64.min <= value, value <= Int64.max {
-            var bytes: [UInt8] = [0xD3]
-            Int64(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
-        }
-
-        let path: [CodingKey]
-        if let additionalKey = additionalKey {
-            path = codingPath + [additionalKey]
-        } else {
-            path = codingPath
+            bytes.append(0xD3)
+            appendBE(Int64(value))
+            return
         }
         throw EncodingError.invalidValue(value, .init(
-            codingPath: path,
+            codingPath: codingPath.appending(additionalKey),
             debugDescription: "Unable to encode \(T.self).\(value) directly in MessagePack."
         ))
     }
 
-    func wrapUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: T, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
+    func writeUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: T, codingPath: [CodingKey], additionalKey: CodingKey?) throws {
         if value <= Int.fixMax {
-            return .literal([UInt8(value)])
+            bytes.append(UInt8(value))
+            return
         }
         if value <= UInt8.max {
-            return .literal([0xCC, UInt8(value)])
+            bytes.append(0xCC)
+            bytes.append(UInt8(value))
+            return
         }
         if value <= UInt16.max {
-            var bytes: [UInt8] = [0xCD]
-            UInt16(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(0xCD)
+            appendBE(UInt16(value))
+            return
         }
         if value <= UInt32.max {
-            var bytes: [UInt8] = [0xCE]
-            UInt32(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
+            bytes.append(0xCE)
+            appendBE(UInt32(value))
+            return
         }
         if value <= UInt64.max {
-            var bytes: [UInt8] = [0xCF]
-            UInt64(value).appendBigEndian(to: &bytes)
-            return .literal(bytes)
-        }
-
-        let path: [CodingKey]
-        if let additionalKey = additionalKey {
-            path = codingPath + [additionalKey]
-        } else {
-            path = codingPath
+            bytes.append(0xCF)
+            appendBE(UInt64(value))
+            return
         }
         throw EncodingError.invalidValue(value, .init(
-            codingPath: path,
+            codingPath: codingPath.appending(additionalKey),
             debugDescription: "Unable to encode \(T.self).\(value) directly in MessagePack."
         ))
     }
 
-    func wrapBool(_ value: Bool) -> MsgPackEncodedValue {
-        .literal(value ? [0xC3] : [0xC2])
-    }
-
-    func wrapStringKey(_ value: String, for key: CodingKey?) throws -> MsgPackStringKey {
-        try MsgPackStringKey(stringValue: value, msgPackValue: wrapString(value, for: key))
-    }
-
-    func wrapString(_ value: String, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
-        if let value = wrapRaw(value.utf8) { return value }
-        let path: [CodingKey]
-        if let additionalKey = additionalKey {
-            path = codingPath + [additionalKey]
-        } else {
-            path = codingPath
-        }
-        throw EncodingError.invalidValue(value, .init(
-            codingPath: path,
-            debugDescription: "Unable to encode String.\(value) directly in MessagePack."
-        ))
-    }
-
-    func wrapRaw<C: Collection>(_ value: C) -> MsgPackEncodedValue? where C.Element == UInt8 {
-        let n = value.count
-        var bits: [UInt8] = []
-        bits.reserveCapacity(n + 5)
-        if n <= UInt.maxUint5 {
-            bits.append(UInt8(0xA0 + n))
-        } else if n <= UInt16.max {
-            if options.contains(.str8FormatSupport), n <= UInt8.max {
-                bits.append(0xD9)
-                bits.append(UInt8(n))
-            } else {
-                bits.append(0xDA)
-                UInt16(n).appendBigEndian(to: &bits)
-            }
-        } else if n <= UInt32.max {
-            bits.append(0xDB)
-            UInt32(n).appendBigEndian(to: &bits)
-        } else {
-            return nil
-        }
-        bits.append(contentsOf: value)
-        return .literal(bits)
-    }
-
-    func wrapEncodable<E: Encodable>(_ encodable: E, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue? {
-        switch encodable {
-        case let raw as MsgPackRawValue:
-            return try wrapMsgPackRawValue(raw, for: additionalKey)
-        case let data as Data:
-            return try wrapData(data, for: additionalKey)
-        case let msgPack as MsgPackEncodable:
-            return try wrapMsgPackEncodable(msgPack, for: additionalKey)
-        default: break
-        }
-        let encoder = getEncoder(for: additionalKey)
-        try encodable.encode(to: encoder)
-
-        if let anyCodable = encodable as? AnyCodable {
-            if anyCodable.base as? _MsgPackDictionaryEncodableMarker != nil {
-                return encoder.value?.asMap()
-            }
-        } else {
-            if (encodable as? _MsgPackDictionaryEncodableMarker) != nil {
-                return encoder.value?.asMap()
-            }
-        }
-        return encoder.value
-    }
-
-    func wrapEncodable<E: EncodableWithConfiguration>(_ encodable: E, configuration: E.EncodingConfiguration, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue? {
-        switch encodable {
-        case let raw as MsgPackRawValue:
-            return try wrapMsgPackRawValue(raw, for: additionalKey)
-        case let data as Data:
-            return try wrapData(data, for: additionalKey)
-        case let msgPack as MsgPackEncodable:
-            return try wrapMsgPackEncodable(msgPack, for: additionalKey)
-        default: break
-        }
-        let encoder = getEncoder(for: additionalKey)
-        try encodable.encode(to: encoder, configuration: configuration)
-
-        if let anyCodable = encodable as? AnyCodable {
-            if anyCodable.base as? _MsgPackDictionaryEncodableMarker != nil {
-                return encoder.value?.asMap()
-            }
-        } else {
-            if (encodable as? _MsgPackDictionaryEncodableMarker) != nil {
-                return encoder.value?.asMap()
-            }
-        }
-        return encoder.value
-    }
-
-    func wrapMsgPackRawValue(_ raw: MsgPackRawValue, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
-        guard !raw.data.isEmpty else {
-            let path: [CodingKey]
-            if let additionalKey = additionalKey {
-                path = codingPath + [additionalKey]
-            } else {
-                path = codingPath
-            }
-            throw EncodingError.invalidValue(raw, .init(
-                codingPath: path,
-                debugDescription: "MsgPackRawValue has empty data."
+    func writeString(_ value: String, codingPath: [CodingKey], additionalKey: CodingKey?, options: MsgPackEncoder.OutputOption) throws {
+        guard writeRaw(value.utf8, str8: options.contains(.str8FormatSupport)) else {
+            throw EncodingError.invalidValue(value, .init(
+                codingPath: codingPath.appending(additionalKey),
+                debugDescription: "Unable to encode String.\(value) directly in MessagePack."
             ))
         }
-        return .literal([UInt8](raw.data))
     }
 
-    func wrapData(_ data: Data, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
+    /// Writes a str-family header + raw UTF-8/byte payload. Returns false when
+    /// the payload is too large to represent.
+    @discardableResult
+    private func writeRaw<C: Collection>(_ value: C, str8: Bool) -> Bool where C.Element == UInt8 {
+        let n = value.count
+        if n <= UInt.maxUint5 {
+            bytes.append(UInt8(0xA0 + n))
+        } else if n <= UInt16.max {
+            if str8, n <= UInt8.max {
+                bytes.append(0xD9)
+                bytes.append(UInt8(n))
+            } else {
+                bytes.append(0xDA)
+                appendBE(UInt16(n))
+            }
+        } else if n <= UInt32.max {
+            bytes.append(0xDB)
+            appendBE(UInt32(n))
+        } else {
+            return false
+        }
+        bytes.append(contentsOf: value)
+        return true
+    }
+
+    func writeData(_ data: Data, codingPath: [CodingKey], additionalKey: CodingKey?, options: MsgPackEncoder.OutputOption) throws {
         if options.contains(.str8FormatSupport) {
             let n = data.count
             if n <= UInt32.max {
-                var bits: [UInt8] = []
-                bits.reserveCapacity(n + 5)
                 if n <= UInt8.max {
-                    bits.append(0xC4)
-                    bits.append(UInt8(n))
+                    bytes.append(0xC4)
+                    bytes.append(UInt8(n))
                 } else if n <= UInt16.max {
-                    bits.append(0xC5)
-                    UInt16(n).appendBigEndian(to: &bits)
+                    bytes.append(0xC5)
+                    appendBE(UInt16(n))
                 } else {
-                    bits.append(0xC6)
-                    UInt32(n).appendBigEndian(to: &bits)
+                    bytes.append(0xC6)
+                    appendBE(UInt32(n))
                 }
-                bits.append(contentsOf: data)
-                return .literal(bits)
+                bytes.append(contentsOf: data)
+                return
             }
-        } else {
-            if let value = wrapRaw(data) {
-                return value
-            }
-        }
-        let path: [CodingKey]
-        if let additionalKey = additionalKey {
-            path = codingPath + [additionalKey]
-        } else {
-            path = codingPath
+        } else if writeRaw(data, str8: false) {
+            return
         }
         throw EncodingError.invalidValue(data, .init(
-            codingPath: path,
+            codingPath: codingPath.appending(additionalKey),
             debugDescription: "Unable to encode Data.\(data) directly in MessagePack."
         ))
     }
 
-    func wrapMsgPackEncodable(_ encodable: MsgPackEncodable, for additionalKey: CodingKey?) throws -> MsgPackEncodedValue {
+    func writeMsgPackRawValue(_ raw: MsgPackRawValue, codingPath: [CodingKey], additionalKey: CodingKey?) throws {
+        guard !raw.data.isEmpty else {
+            throw EncodingError.invalidValue(raw, .init(
+                codingPath: codingPath.appending(additionalKey),
+                debugDescription: "MsgPackRawValue has empty data."
+            ))
+        }
+        bytes.append(contentsOf: raw.data)
+    }
+
+    func writeExt(_ encodable: MsgPackEncodable, codingPath: [CodingKey], additionalKey: CodingKey?) throws {
         let data = try encodable.encodeMsgPack()
         let n = data.count
-        var d = [UInt8]()
-        d.reserveCapacity(n + 6)
         switch n {
-        case 1:
-            d.append(0xD4)
-        case 2:
-            d.append(0xD5)
-        case 4:
-            d.append(0xD6)
-        case 8:
-            d.append(0xD7)
-        case 16:
-            d.append(0xD8)
+        case 1: bytes.append(0xD4)
+        case 2: bytes.append(0xD5)
+        case 4: bytes.append(0xD6)
+        case 8: bytes.append(0xD7)
+        case 16: bytes.append(0xD8)
         default:
             if n <= UInt8.max {
-                d.append(contentsOf: [0xC7])
-                UInt8(n).appendBigEndian(to: &d)
+                bytes.append(0xC7)
+                bytes.append(UInt8(n))
             } else if n <= UInt16.max {
-                d.append(contentsOf: [0xC8])
-                UInt16(n).appendBigEndian(to: &d)
+                bytes.append(0xC8)
+                appendBE(UInt16(n))
             } else if n <= UInt32.max {
-                d.append(contentsOf: [0xC9])
-                UInt32(n).appendBigEndian(to: &d)
+                bytes.append(0xC9)
+                appendBE(UInt32(n))
             } else {
-                let path: [CodingKey]
-                if let additionalKey = additionalKey {
-                    path = codingPath + [additionalKey]
-                } else {
-                    path = codingPath
-                }
                 throw EncodingError.invalidValue(encodable, .init(
-                    codingPath: path,
-                    debugDescription: "Unable to encode \(type(of: encodable)).\(encodable) directly in MessagePack."
+                    codingPath: codingPath.appending(additionalKey),
+                    debugDescription: "Unable to encode \(Swift.type(of: encodable)).\(encodable) directly in MessagePack."
                 ))
             }
         }
-        encodable.type.appendBigEndian(to: &d)
-        d.append(contentsOf: data)
-        return .ext(encodable.type, d)
+        bytes.append(UInt8(bitPattern: encodable.type))
+        bytes.append(contentsOf: data)
     }
 
-    func getEncoder(for additionalKey: CodingKey?) -> _MsgPackEncoder {
-        if let additionalKey = additionalKey {
-            let newCodingPath: [CodingKey] = codingPath + [additionalKey]
-            return _MsgPackEncoder(codingPath: newCodingPath, options: options, userInfo: userInfo)
+    // MARK: containers
+
+    /// Opens a container, writing a minimal (fixmap/fixarray, 1-byte) header
+    /// placeholder, and returns a reference used to grow/patch its count.
+    func openContainer(isMap: Bool, divisor: Int) -> ContainerHeader {
+        let header = ContainerHeader(offset: bytes.count, isMap: isMap, divisor: divisor)
+        bytes.append(isMap ? 0x80 : 0x90)
+        openHeaders.append(header)
+        return header
+    }
+
+    /// Records one more entry in `header` (a pair for maps, an element for
+    /// arrays) and updates the on-wire count, growing the header size class in
+    /// place if necessary.
+    func addEntry(to header: ContainerHeader) {
+        header.entryCount += 1
+        patchHeader(header)
+    }
+
+    private func patchHeader(_ header: ContainerHeader) {
+        let count = header.entryCount / header.divisor
+        let off = header.offset
+        let cur = bytes[off]
+        let oldWidth: Int
+        if cur == 0xDE || cur == 0xDC {
+            oldWidth = 3
+        } else if cur == 0xDF || cur == 0xDD {
+            oldWidth = 5
+        } else {
+            oldWidth = 1
         }
+        let newWidth = count <= Int(UInt.maxUint4) ? 1 : (count <= Int(UInt16.max) ? 3 : 5)
+        if newWidth > oldWidth {
+            grow(headerAt: off, oldWidth: oldWidth, newWidth: newWidth)
+        }
+        switch newWidth {
+        case 1:
+            bytes[off] = (header.isMap ? 0x80 : 0x90) | UInt8(count)
+        case 3:
+            bytes[off] = header.isMap ? 0xDE : 0xDC
+            patchBE(UInt16(count), at: off + 1)
+        default:
+            bytes[off] = header.isMap ? 0xDF : 0xDD
+            patchBE(UInt32(count), at: off + 1)
+        }
+    }
+
+    private func grow(headerAt off: Int, oldWidth: Int, newWidth: Int) {
+        let insertPos = off + oldWidth
+        let k = newWidth - oldWidth
+        bytes.insert(contentsOf: repeatElement(0, count: k), at: insertPos)
+        for header in openHeaders where header.offset >= insertPos {
+            header.offset += k
+        }
+    }
+
+    // MARK: value dispatch
+
+    func writeValue<E: Encodable>(_ value: E, options: MsgPackEncoder.OutputOption, userInfo: [CodingUserInfoKey: Any], codingPath: [CodingKey], tail: MsgPackPathTail) throws {
+        switch value {
+        case let raw as MsgPackRawValue:
+            try writeMsgPackRawValue(raw, codingPath: codingPath, additionalKey: tail.codingKey)
+            return
+        case let data as Data:
+            try writeData(data, codingPath: codingPath, additionalKey: tail.codingKey, options: options)
+            return
+        case let msgPack as MsgPackEncodable:
+            try writeExt(msgPack, codingPath: codingPath, additionalKey: tail.codingKey)
+            return
+        default:
+            break
+        }
+        let encoder = reuseEncoder(options: options, userInfo: userInfo, basePath: codingPath, tail: tail, mapHint: isDictionary(value))
+        try value.encode(to: encoder)
+    }
+
+    @available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)
+    func writeValue<E: EncodableWithConfiguration>(_ value: E, configuration: E.EncodingConfiguration, options: MsgPackEncoder.OutputOption, userInfo: [CodingUserInfoKey: Any], codingPath: [CodingKey], tail: MsgPackPathTail) throws {
+        switch value {
+        case let raw as MsgPackRawValue:
+            try writeMsgPackRawValue(raw, codingPath: codingPath, additionalKey: tail.codingKey)
+            return
+        case let data as Data:
+            try writeData(data, codingPath: codingPath, additionalKey: tail.codingKey, options: options)
+            return
+        case let msgPack as MsgPackEncodable:
+            try writeExt(msgPack, codingPath: codingPath, additionalKey: tail.codingKey)
+            return
+        default:
+            break
+        }
+        let encoder = reuseEncoder(options: options, userInfo: userInfo, basePath: codingPath, tail: tail, mapHint: isDictionary(value))
+        try value.encode(to: encoder, configuration: configuration)
+    }
+
+    private func reuseEncoder(options: MsgPackEncoder.OutputOption, userInfo: [CodingUserInfoKey: Any], basePath: [CodingKey], tail: MsgPackPathTail, mapHint: Bool) -> _MsgPackEncoder {
+        if let encoder = reusableEncoder {
+            encoder.basePath = basePath
+            encoder.tail = tail
+            encoder.mapHint = mapHint
+            return encoder
+        }
+        let encoder = _MsgPackEncoder(buffer: self, options: options, userInfo: userInfo, basePath: basePath, tail: tail, mapHint: mapHint)
+        reusableEncoder = encoder
         return encoder
     }
+
+    private func isDictionary(_ value: Any) -> Bool {
+        if value is _MsgPackDictionaryEncodableMarker { return true }
+        if let any = value as? AnyCodable, any.base is _MsgPackDictionaryEncodableMarker { return true }
+        return false
+    }
 }
 
-private struct MsgPackSingleValueEncodingContainer: SingleValueEncodingContainer, _SpecialTreatmentEncoder {
+/// Reference to an open container's header position and running entry count.
+/// A class so container structs can share and mutate it by reference.
+final class ContainerHeader {
+    var offset: Int
+    var entryCount: Int = 0
+    let isMap: Bool
+    /// On-wire count = `entryCount / divisor`. `1` for arrays and keyed maps,
+    /// `2` for a Swift dictionary that encodes as an alternating key/value
+    /// unkeyed container but must be emitted as a map.
+    let divisor: Int
+
+    init(offset: Int, isMap: Bool, divisor: Int) {
+        self.offset = offset
+        self.isMap = isMap
+        self.divisor = divisor
+    }
+}
+
+// MARK: - Encoder
+
+private final class _MsgPackEncoder: Encoder {
+    unowned let buffer: MsgPackWriteBuffer
+    let options: MsgPackEncoder.OutputOption
+    var userInfo: [CodingUserInfoKey: Any]
+    /// The nested coding path is `basePath` + `tail`, materialised only when
+    /// something actually reads `codingPath` — the hot path never allocates
+    /// the appended array.
+    var basePath: [CodingKey]
+    var tail: MsgPackPathTail
+    var codingPath: [CodingKey] { tail.appended(to: basePath) }
+    /// When set, an unkeyed container opened by this encoder is emitted as a
+    /// map (used for dictionaries with non-string/int keys).
+    var mapHint: Bool
+
+    init(buffer: MsgPackWriteBuffer, options: MsgPackEncoder.OutputOption, userInfo: [CodingUserInfoKey: Any], basePath: [CodingKey], tail: MsgPackPathTail, mapHint: Bool) {
+        self.buffer = buffer
+        self.options = options
+        self.userInfo = userInfo
+        self.basePath = basePath
+        self.tail = tail
+        self.mapHint = mapHint
+    }
+
+    func container<Key>(keyedBy _: Key.Type) -> KeyedEncodingContainer<Key> where Key: CodingKey {
+        let header = buffer.openContainer(isMap: true, divisor: 1)
+        return KeyedEncodingContainer(MsgPackKeyedEncodingContainer(encoder: self, header: header, codingPath: codingPath))
+    }
+
+    func unkeyedContainer() -> UnkeyedEncodingContainer {
+        let header = buffer.openContainer(isMap: mapHint, divisor: mapHint ? 2 : 1)
+        return MsgPackUnkeyedEncodingContainer(encoder: self, header: header, codingPath: codingPath)
+    }
+
+    func singleValueContainer() -> SingleValueEncodingContainer {
+        MsgPackSingleValueEncodingContainer(encoder: self)
+    }
+}
+
+// MARK: - Single value container
+
+private struct MsgPackSingleValueEncodingContainer: SingleValueEncodingContainer {
     let encoder: _MsgPackEncoder
-    let codingPath: [CodingKey]
+    /// Computed on demand: the container is consumed synchronously before the
+    /// reused encoder's path can change, and leaf writes only read the path
+    /// on their error exits.
+    var codingPath: [CodingKey] { encoder.codingPath }
 
-    init(encoder: _MsgPackEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        self.codingPath = codingPath
-    }
+    private var buffer: MsgPackWriteBuffer { encoder.buffer }
+    private var basePath: [CodingKey] { encoder.basePath }
+    private var tailKey: CodingKey? { encoder.tail.codingKey }
 
-    var options: MsgPackEncoder.OutputOption {
-        encoder.options
-    }
-
-    var userInfo: [CodingUserInfoKey: Any] {
-        encoder.userInfo
-    }
-
-    public func encodeNil() throws {
-        encoder.singleValue = .Nil
-    }
-
-    public func encode(_ value: Bool) throws {
-        encoder.singleValue = encoder.wrapBool(value)
-    }
-
-    public func encode(_ value: String) throws {
-        encoder.singleValue = try encoder.wrapString(value, for: nil)
-    }
-
-    public func encode(_ value: Double) throws {
-        try encodeFloat(value)
-    }
-
-    public func encode(_ value: Float) throws {
-        try encodeFloat(value)
-    }
-
-    public func encode(_ value: Int) throws {
-        try encodeInt(value)
-    }
-
-    public func encode(_ value: Int8) throws {
-        try encodeInt(value)
-    }
-
-    public func encode(_ value: Int16) throws {
-        try encodeInt(value)
-    }
-
-    public func encode(_ value: Int32) throws {
-        try encodeInt(value)
-    }
-
-    public func encode(_ value: Int64) throws {
-        try encodeInt(value)
-    }
+    func encodeNil() throws { buffer.writeNil() }
+    func encode(_ value: Bool) throws { buffer.writeBool(value) }
+    func encode(_ value: String) throws { try buffer.writeString(value, codingPath: basePath, additionalKey: tailKey, options: encoder.options) }
+    func encode(_ value: Double) throws { buffer.writeDouble(value) }
+    func encode(_ value: Float) throws { buffer.writeFloat(value) }
+    func encode(_ value: Int) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: Int8) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: Int16) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: Int32) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: Int64) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
 
     @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
-    public func encode(_ value: Int128) throws {
-        try encodeInt(value)
-    }
+    func encode(_ value: Int128) throws { try buffer.writeInt(value, codingPath: basePath, additionalKey: tailKey) }
 
-    public func encode(_ value: UInt) throws {
-        try encodeUInt(value)
-    }
-
-    public func encode(_ value: UInt8) throws {
-        try encodeUInt(value)
-    }
-
-    public func encode(_ value: UInt16) throws {
-        try encodeUInt(value)
-    }
-
-    public func encode(_ value: UInt32) throws {
-        try encodeUInt(value)
-    }
-
-    public func encode(_ value: UInt64) throws {
-        try encodeUInt(value)
-    }
+    func encode(_ value: UInt) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: UInt8) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: UInt16) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: UInt32) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
+    func encode(_ value: UInt64) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
 
     @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
-    public func encode(_ value: UInt128) throws {
-        try encodeUInt(value)
-    }
-
-    public func encode<T>(_ value: T) throws where T: Encodable {
-        encoder.singleValue = try wrapEncodable(value, for: nil)
-    }
-
-    @inline(__always)
-    private func encodeInt<T: SignedInteger & FixedWidthInteger>(_ value: T) throws {
-        encoder.singleValue = try encoder.wrapInt(value, for: nil)
-    }
-
-    @inline(__always)
-    private func encodeUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: T) throws {
-        encoder.singleValue = try encoder.wrapUInt(value, for: nil)
-    }
-
-    @inline(__always)
-    private func encodeFloat<T: FloatingPoint & DataNumber>(_ value: T) throws {
-        encoder.singleValue = try encoder.wrapFloat(value, for: nil)
-    }
-}
-
-private struct MsgPackUnkeyedEncodingContainer: UnkeyedEncodingContainer {
-    private let encoder: _MsgPackEncoder
-    let array: MsgPackFuture.RefArray
-    private(set) var codingPath: [CodingKey]
-    var count: Int {
-        array.array.count
-    }
-
-    init(referencing encoder: _MsgPackEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        array = encoder.array!
-        self.codingPath = codingPath
-    }
-
-    init(referencing encoder: _MsgPackEncoder, array: MsgPackFuture.RefArray, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        self.array = array
-        self.codingPath = codingPath
-    }
-
-    func encodeNil() throws {
-        array.append(.Nil)
-    }
-
-    func encode(_ value: Bool) throws {
-        array.append(encoder.wrapBool(value))
-    }
-
-    func encode(_ value: String) throws {
-        try array.append(encoder.wrapString(value, for: nil))
-    }
-
-    func encode(_ value: Double) throws {
-        try encodeFloat(value)
-    }
-
-    func encode(_ value: Float) throws {
-        try encodeFloat(value)
-    }
-
-    func encode(_ value: Int) throws {
-        try encodeInt(value)
-    }
-
-    func encode(_ value: Int8) throws {
-        try encodeInt(value)
-    }
-
-    func encode(_ value: Int16) throws {
-        try encodeInt(value)
-    }
-
-    func encode(_ value: Int32) throws {
-        try encodeInt(value)
-    }
-
-    func encode(_ value: Int64) throws {
-        try encodeInt(value)
-    }
-
-    func encode(_ value: UInt) throws {
-        try encodeUInt(value)
-    }
-
-    func encode(_ value: UInt8) throws {
-        try encodeUInt(value)
-    }
-
-    func encode(_ value: UInt16) throws {
-        try encodeUInt(value)
-    }
-
-    func encode(_ value: UInt32) throws {
-        try encodeUInt(value)
-    }
-
-    func encode(_ value: UInt64) throws {
-        try encodeUInt(value)
-    }
+    func encode(_ value: UInt128) throws { try buffer.writeUInt(value, codingPath: basePath, additionalKey: tailKey) }
 
     func encode<T>(_ value: T) throws where T: Encodable {
-        let key: MsgPackKey = .init(index: count)
-        let encoded = try encoder.wrapEncodable(value, for: key)
-        array.append(encoded ?? .Nil)
+        try buffer.writeValue(value, options: encoder.options, userInfo: encoder.userInfo, codingPath: basePath, tail: encoder.tail)
     }
+}
 
-    private func encodeUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: T) throws {
-        try array.append(encoder.wrapUInt(value, for: nil))
-    }
+// MARK: - Unkeyed container
 
-    private func encodeInt<T: SignedInteger & FixedWidthInteger>(_ value: T) throws {
-        try array.append(encoder.wrapInt(value, for: nil))
-    }
+private struct MsgPackUnkeyedEncodingContainer: UnkeyedEncodingContainer {
+    let encoder: _MsgPackEncoder
+    let header: ContainerHeader
+    let codingPath: [CodingKey]
 
-    private func encodeFloat<T: FloatingPoint & DataNumber>(_ value: T) throws {
-        try array.append(encoder.wrapFloat(value, for: nil))
+    private var buffer: MsgPackWriteBuffer { encoder.buffer }
+    var count: Int { header.entryCount }
+
+    func encodeNil() throws { buffer.addEntry(to: header); buffer.writeNil() }
+    func encode(_ value: Bool) throws { buffer.addEntry(to: header); buffer.writeBool(value) }
+    func encode(_ value: String) throws { buffer.addEntry(to: header); try buffer.writeString(value, codingPath: codingPath, additionalKey: nil, options: encoder.options) }
+    func encode(_ value: Double) throws { buffer.addEntry(to: header); buffer.writeDouble(value) }
+    func encode(_ value: Float) throws { buffer.addEntry(to: header); buffer.writeFloat(value) }
+    func encode(_ value: Int) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: Int8) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: Int16) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: Int32) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: Int64) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+
+    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+    func encode(_ value: Int128) throws { buffer.addEntry(to: header); try buffer.writeInt(value, codingPath: codingPath, additionalKey: nil) }
+
+    func encode(_ value: UInt) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: UInt8) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: UInt16) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: UInt32) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+    func encode(_ value: UInt64) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+
+    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
+    func encode(_ value: UInt128) throws { buffer.addEntry(to: header); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: nil) }
+
+    func encode<T>(_ value: T) throws where T: Encodable {
+        let index = count
+        buffer.addEntry(to: header)
+        let start = buffer.count
+        try buffer.writeValue(value, options: encoder.options, userInfo: encoder.userInfo, codingPath: codingPath, tail: .index(index))
+        if buffer.count == start { buffer.writeNil() }
     }
 
     func nestedContainer<NestedKey>(keyedBy _: NestedKey.Type) -> KeyedEncodingContainer<NestedKey> where NestedKey: CodingKey {
         let newPath = codingPath + [MsgPackKey(index: count)]
-        let map = array.appendMap()
-        let nestedContainer = MsgPackKeyedEncodingContainer<NestedKey>(referencing: encoder, map: map, codingPath: newPath)
-        return KeyedEncodingContainer(nestedContainer)
+        buffer.addEntry(to: header)
+        let child = buffer.openContainer(isMap: true, divisor: 1)
+        return KeyedEncodingContainer(MsgPackKeyedEncodingContainer(encoder: encoder, header: child, codingPath: newPath))
     }
 
     func nestedUnkeyedContainer() -> UnkeyedEncodingContainer {
         let newPath = codingPath + [MsgPackKey(index: count)]
-        let array = array.appendArray()
-        let nestedContainer = MsgPackUnkeyedEncodingContainer(referencing: encoder, array: array, codingPath: newPath)
-        return nestedContainer
+        buffer.addEntry(to: header)
+        let child = buffer.openContainer(isMap: false, divisor: 1)
+        return MsgPackUnkeyedEncodingContainer(encoder: encoder, header: child, codingPath: newPath)
     }
 
     func superEncoder() -> Encoder {
-        let encoder = encoder.getEncoder(for: MsgPackKey(index: count))
-        array.append(encoder)
-        return encoder
+        buffer.addEntry(to: header)
+        return _superEncoder(index: count - 1)
+    }
+
+    private func _superEncoder(index: Int) -> Encoder {
+        _MsgPackEncoder(buffer: buffer, options: encoder.options, userInfo: encoder.userInfo, basePath: codingPath, tail: .index(index), mapHint: false)
     }
 }
+
+// MARK: - Keyed container
 
 private struct MsgPackKeyedEncodingContainer<K: CodingKey>: KeyedEncodingContainerProtocol {
     typealias Key = K
 
-    private let encoder: _MsgPackEncoder
-    let map: MsgPackFuture.RefMap
-    private(set) var codingPath: [CodingKey]
+    let encoder: _MsgPackEncoder
+    let header: ContainerHeader
+    let codingPath: [CodingKey]
 
-    init(referencing encoder: _MsgPackEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        self.codingPath = codingPath
-        map = encoder.map!
+    private var buffer: MsgPackWriteBuffer { encoder.buffer }
+
+    @inline(__always)
+    private func writeKey(_ key: Key) throws {
+        buffer.addEntry(to: header)
+        try buffer.writeString(key.stringValue, codingPath: codingPath, additionalKey: key, options: encoder.options)
     }
 
-    init(referencing encoder: _MsgPackEncoder, map: MsgPackFuture.RefMap, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        self.codingPath = codingPath
-        self.map = map
-    }
-
-    func encodeNil(forKey key: Key) throws {
-        try map.set(.Nil, for: encoder.wrapStringKey(key.stringValue, for: key))
-    }
-
-    func encode(_ value: Bool, forKey key: Key) throws {
-        let value = encoder.wrapBool(value)
-        try map.set(value, for: encoder.wrapStringKey(key.stringValue, for: key))
-    }
-
-    func encode(_ value: String, forKey key: Key) throws {
-        let value = try encoder.wrapString(value, for: key)
-        try map.set(value, for: encoder.wrapStringKey(key.stringValue, for: key))
-    }
-
-    func encode(_ value: Double, forKey key: Key) throws {
-        try encodeFloat(value, for: key)
-    }
-
-    func encode(_ value: Float, forKey key: Key) throws {
-        try encodeFloat(value, for: key)
-    }
-
-    func encode(_ value: Int, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
-
-    func encode(_ value: Int8, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
-
-    func encode(_ value: Int16, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
-
-    func encode(_ value: Int32, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
-
-    func encode(_ value: Int64, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
+    func encodeNil(forKey key: Key) throws { try writeKey(key); buffer.writeNil() }
+    func encode(_ value: Bool, forKey key: Key) throws { try writeKey(key); buffer.writeBool(value) }
+    func encode(_ value: String, forKey key: Key) throws { try writeKey(key); try buffer.writeString(value, codingPath: codingPath, additionalKey: key, options: encoder.options) }
+    func encode(_ value: Double, forKey key: Key) throws { try writeKey(key); buffer.writeDouble(value) }
+    func encode(_ value: Float, forKey key: Key) throws { try writeKey(key); buffer.writeFloat(value) }
+    func encode(_ value: Int, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: Int8, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: Int16, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: Int32, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: Int64, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
 
     @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
-    public func encode(_ value: Int128, forKey key: Key) throws {
-        try encodeInt(value, for: key)
-    }
+    func encode(_ value: Int128, forKey key: Key) throws { try writeKey(key); try buffer.writeInt(value, codingPath: codingPath, additionalKey: key) }
 
-    func encode(_ value: UInt, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
-
-    func encode(_ value: UInt8, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
-
-    func encode(_ value: UInt16, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
-
-    func encode(_ value: UInt32, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
-
-    func encode(_ value: UInt64, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
+    func encode(_ value: UInt, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: UInt8, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: UInt16, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: UInt32, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
+    func encode(_ value: UInt64, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
 
     @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *)
-    public func encode(_ value: UInt128, forKey key: Key) throws {
-        try encodeUInt(value, forKey: key)
-    }
+    func encode(_ value: UInt128, forKey key: Key) throws { try writeKey(key); try buffer.writeUInt(value, codingPath: codingPath, additionalKey: key) }
 
     func encode<T>(_ value: T, forKey key: Key) throws where T: Encodable {
-        let encoded = try encoder.wrapEncodable(value, for: key)
-        try map.set(encoded ?? .Nil, for: encoder.wrapStringKey(key.stringValue, for: key))
+        try writeKey(key)
+        let start = buffer.count
+        try buffer.writeValue(value, options: encoder.options, userInfo: encoder.userInfo, codingPath: codingPath, tail: .key(key))
+        if buffer.count == start { buffer.writeNil() }
     }
 
     func nestedContainer<NestedKey>(keyedBy _: NestedKey.Type, forKey key: Key) -> KeyedEncodingContainer<NestedKey> where NestedKey: CodingKey {
         let newPath = codingPath + [key]
-        let map: MsgPackFuture.RefMap = map.setMap(for: try! encoder.wrapStringKey(key.stringValue, for: key))
-        let nestedContainer = MsgPackKeyedEncodingContainer<NestedKey>(referencing: encoder, map: map, codingPath: newPath)
-        return KeyedEncodingContainer(nestedContainer)
+        try? writeKey(key)
+        let child = buffer.openContainer(isMap: true, divisor: 1)
+        return KeyedEncodingContainer(MsgPackKeyedEncodingContainer<NestedKey>(encoder: encoder, header: child, codingPath: newPath))
     }
 
-    func nestedUnkeyedContainer(forKey key: Self.Key) -> UnkeyedEncodingContainer {
+    func nestedUnkeyedContainer(forKey key: Key) -> UnkeyedEncodingContainer {
         let newPath = codingPath + [key]
-        let array: MsgPackFuture.RefArray = map.setArray(for: try! encoder.wrapStringKey(key.stringValue, for: key))
-        let nestedContainer = MsgPackUnkeyedEncodingContainer(referencing: encoder, array: array, codingPath: newPath)
-        return nestedContainer
+        try? writeKey(key)
+        let child = buffer.openContainer(isMap: false, divisor: 1)
+        return MsgPackUnkeyedEncodingContainer(encoder: encoder, header: child, codingPath: newPath)
     }
 
     func superEncoder() -> Encoder {
-        let newEncoder = encoder.getEncoder(for: MsgPackKey.super)
-        map.set(newEncoder, for: try! encoder.wrapStringKey(MsgPackKey.super.stringValue, for: nil))
-        return newEncoder
+        superEncoderImpl(key: MsgPackKey.super)
     }
 
     func superEncoder(forKey key: Key) -> Encoder {
-        let newEncoder = encoder.getEncoder(for: key)
-        map.set(newEncoder, for: try! encoder.wrapStringKey(key.stringValue, for: key))
-        return newEncoder
+        superEncoderImpl(key: key)
     }
 
-    private func encodeFloat<T: FloatingPoint & DataNumber>(_ value: T, for key: Key) throws {
-        let value = try encoder.wrapFloat(value, for: nil)
-        try map.set(value, for: encoder.wrapStringKey(key.stringValue, for: key))
+    private func superEncoderImpl(key: CodingKey) -> Encoder {
+        try? writeKey2(key)
+        return _MsgPackEncoder(buffer: buffer, options: encoder.options, userInfo: encoder.userInfo, basePath: codingPath, tail: .key(key), mapHint: false)
     }
 
-    private func encodeInt<T: SignedInteger & FixedWidthInteger>(_ value: T, for key: Key) throws {
-        let value = try encoder.wrapInt(value, for: key)
-        try map.set(value, for: encoder.wrapStringKey(key.stringValue, for: key))
+    @inline(__always)
+    private func writeKey2(_ key: CodingKey) throws {
+        buffer.addEntry(to: header)
+        try buffer.writeString(key.stringValue, codingPath: codingPath, additionalKey: key, options: encoder.options)
+    }
+}
+
+// MARK: - Support
+
+/// The last component of a nested coding path, kept unmaterialised so hot
+/// paths never build the appended `[CodingKey]` array (or the "Index N" key)
+/// unless an error context or a `codingPath` read actually needs it.
+enum MsgPackPathTail {
+    case none
+    case key(CodingKey)
+    case index(Int)
+
+    var codingKey: CodingKey? {
+        switch self {
+        case .none: return nil
+        case let .key(k): return k
+        case let .index(i): return MsgPackKey(index: i)
+        }
     }
 
-    private func encodeUInt<T: UnsignedInteger & FixedWidthInteger>(_ value: T, forKey key: Key) throws {
-        let value = try encoder.wrapUInt(value, for: key)
-        try map.set(value, for: encoder.wrapStringKey(key.stringValue, for: key))
+    func appended(to base: [CodingKey]) -> [CodingKey] {
+        guard let key = codingKey else { return base }
+        return base + [key]
     }
 }
 
@@ -1019,6 +725,21 @@ struct MsgPackKey: CodingKey {
     }
 
     static let `super`: MsgPackKey = .init(stringValue: "super")
+}
+
+extension FixedWidthInteger {
+    func appendBigEndian(to buffer: inout [UInt8]) {
+        withUnsafeBytes(of: bigEndian) { ptr in
+            buffer.append(contentsOf: ptr)
+        }
+    }
+}
+
+private extension [CodingKey] {
+    func appending(_ key: CodingKey?) -> [CodingKey] {
+        guard let key = key else { return self }
+        return self + [key]
+    }
 }
 
 private extension Int {
