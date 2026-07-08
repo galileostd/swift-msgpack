@@ -141,6 +141,117 @@ Add the following to your Podfile:
 ```terminal
 pod 'SwiftMessagePack'
 ```
+## Benchmarks
+
+This fork tracks encoder/decoder performance for the NyaruDB2 database engine.
+The `bench` executable target measures the coder pair against the frozen
+`v1.3.0` baseline (vendored in `Sources/MsgpackBaselineV1`) and Foundation
+JSON as an external yardstick.
+
+Run it with:
+
+```terminal
+swift run -c release bench
+```
+
+The reference shape mirrors NyaruDB2's harness document:
+
+```swift
+struct HarnessUser: Codable {
+    let id: Int
+    let name: String        // ~12 chars
+    let email: String       // ~20 chars
+    let age: Int
+    let city: String        // ~8 chars, 10 distinct values
+    let createdAt: Date
+    let tags: [String]      // 0–3 short strings
+}
+```
+
+**Ship gate (NyaruDB2 roadmap):** a change to the coders merges only if it is
+≥1.5× faster on decode **or** ≥1.3× faster on encode versus `v1.3.0` on the
+reference shape, with the compatibility/robustness suite green.
+
+### P2.1 streaming encoder — landed (10,000 docs, best-of-15, Apple Silicon, Swift 6.2.4)
+
+Reference shape `HarnessUser`, `current` = streaming encoder vs frozen `v1.3.0`:
+
+| Operation | v1.3.0 (µs/op) | current (µs/op) | Foundation JSON (µs/op) | current vs v1.3.0 |
+|-----------|---------------:|----------------:|------------------------:|------------------:|
+| encode            | 4.513 | 2.224 | 2.912 | **2.03×** |
+| decode (eager)    | 2.840 | 2.678 | 2.644 | 1.06× |
+| decode (lazyScan) | 3.322 | 3.352 | 2.644 | 0.99× |
+
+Avg payload: msgpack 115.8 B, JSON 145.0 B (byte-identical to v1.3.0 — headers
+stay minimal).
+
+**Result:** encode is **2.03× faster than v1.3.0** (gate: ≥1.3×) and now beats
+Foundation JSON encode. Decode is unchanged (P2.1 is encoder-only; ±noise). The
+old path built a full `MsgPackEncodedValue` tree per document and walked it
+twice (`MsgPackValue.Writer.byteSize` then `writeValue`); the streaming encoder
+(`MsgPackWriteBuffer`) writes MessagePack directly into one growable buffer.
+
+String-heavy variant (5 strings): encode **2.15× faster** (2.115 → 0.983 µs/op).
+
+Design notes:
+- Minimal size-class headers are preserved (byte-identical output, all
+  exact-hex `EncodeTests` pass) via in-place count patching, growing a header
+  with a one-time `memmove` only when a container crosses 16 or 65536 entries.
+- Zero heap allocations per leaf field: `Int`/`UInt`/`Float`/`Double`/`Bool`/
+  `String`/keys are written straight into the buffer (`String` via
+  `string.utf8`, no `Data` intermediate). One `_MsgPackEncoder` instance is
+  reused for every nested value within a top-level `encode` call.
+- Full cross-version + robustness suite green (§5), so v1.3.0 databases keep
+  decoding and new output decodes under v1.3.0.
+
+### §3 Date-cost probe (single-field structs, v1.3.0)
+
+| Field | encode (µs/op) | decode (µs/op) | payload (B) |
+|-------|---------------:|---------------:|------------:|
+| Date  | 1.229 | 0.800 | 20 |
+| Int   | 0.843 | 0.566 | 8 |
+
+`Date` costs only ~1.4× an `Int` (not 10–50×). `Date` encodes as a plain
+`float64` (9-byte value) via standard `Codable`, **not** the msgpack timestamp
+extension — there is no per-call `Data` packing to eliminate, and any fast path
+would change the wire format. **Verdict: no Date fast path; §3 is a measurement,
+not an optimization target.**
+
+### String-heavy variant (5 strings)
+
+| Operation | v1.3.0 (µs/op) | current (µs/op) | current vs v1.3.0 |
+|-----------|---------------:|----------------:|------------------:|
+| encode         | 2.413 | 2.298 | 1.05× |
+| decode (eager) | 1.431 | 1.409 | 1.02× |
+
+### P2.2 decoder — byte-compared keys, and why ≥1.5× decode is not reachable here
+
+The `.lazyScan` keyed decoder (`LazyMapCursor`) no longer allocates a `String`
+per on-wire map key or builds a key→index dictionary: keys are matched by raw
+UTF-8 bytes against the requested key, keeping the existing sequential
+walk-and-cache behaviour. Effect, isolated on a scalar-only struct:
+
+| Shape (decode, lazyScan) | v1.3.0 (µs/op) | current (µs/op) | current vs v1.3.0 |
+|--------------------------|---------------:|----------------:|------------------:|
+| 7×`Int` struct (no str/Date/array) | 1.731 | 1.506 | **1.15×** |
+| `HarnessUser` (3 str + Date + [String]) | 3.005 | 3.139 | ~1.0× |
+
+**The ≥1.5× decode target is not achievable on `HarnessUser`.** Isolation shows
+the decoder's structural path is already fast (7 ints: 1.15× faster); the
+remaining ~1.6 µs is materialising the struct's values — 5 `String`
+allocations plus `Date`/`[String]` sub-decoders — which is inherent to the
+`Codable` contract (C1: the document *is* a struct of `String`s). For scale:
+Foundation's `JSONDecoder` decodes the same shape at ~2.7 µs, only ~1.1× faster
+than v1.3.0's msgpack decoder — the `String` allocation floor bounds everyone.
+Beating it by 1.5× would require not materialising the strings, i.e. changing
+the document contract.
+
+**Consequence for NyaruDB2:** the overall ship gate (≥1.5× decode **or** ≥1.3×
+encode) is met by P2.1 (encode ~1.9×). The real lever for the Query gap is
+reading/decoding *fewer* bytes and *fewer* fields (roadmap P1.1 coalesced reads
+and P1.6 projections), not squeezing more from a full-struct decode that is
+already allocation-bound.
+
 ## License
 
 swift-msgpack is published under the MIT License. See the LICENSE file for details.
