@@ -737,30 +737,108 @@ private struct MsgPackUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 }
 
+/// Key lookup over an eagerly-scanned map without allocating a `String` per
+/// on-wire key. Declaration-order lookups are matched by raw UTF-8 byte
+/// comparison against a monotonic cursor (repeat lookups of the same key —
+/// the `decodeIfPresent` pattern — re-scan only the already-visited prefix).
+/// The first lookup that would make the linear phase expensive builds a
+/// keep-first `String` index once, restoring the old dictionary behaviour.
+final class EagerMapCursor {
+    /// Beyond this many visited pairs, a linear re-scan stops being cheaper
+    /// than materialising the key index.
+    private static let indexThreshold = 32
+
+    private let flat: [MsgPackValue]
+    private let pairCount: Int
+    private var cursor = 0
+    private var index: [String: Int]?
+
+    init(container: MsgPackValue) {
+        switch container.kind {
+        case let .array(a), let .map(a):
+            flat = a
+        default:
+            let pairs = container.asDictionary()
+            var f: [MsgPackValue] = []
+            f.reserveCapacity(pairs.count * 2)
+            for (k, v) in pairs {
+                f.append(k)
+                f.append(v)
+            }
+            flat = f
+        }
+        pairCount = flat.count / 2
+    }
+
+    func value(forStringKey key: String) -> MsgPackValue? {
+        if let index {
+            guard let i = index[key] else { return nil }
+            return flat[i * 2 + 1]
+        }
+        if cursor > Self.indexThreshold {
+            guard let i = ensureIndex()[key] else { return nil }
+            return flat[i * 2 + 1]
+        }
+        // 1. Already-visited pairs (repeat lookups, out-of-order keys).
+        for i in 0 ..< cursor where flat[i * 2].matchesKeyBytes(key) {
+            return flat[i * 2 + 1]
+        }
+        // 2. Walk forward; declaration-order decoding matches immediately.
+        while cursor < pairCount {
+            let i = cursor
+            cursor += 1
+            if flat[i * 2].matchesKeyBytes(key) {
+                return flat[i * 2 + 1]
+            }
+        }
+        return nil
+    }
+
+    func allStringKeys() -> [String] {
+        Array(ensureIndex().keys)
+    }
+
+    func contains(stringKey key: String) -> Bool {
+        value(forStringKey: key) != nil
+    }
+
+    private func ensureIndex() -> [String: Int] {
+        if let index { return index }
+        var d = [String: Int](minimumCapacity: pairCount)
+        for i in 0 ..< pairCount {
+            if case let .literal(.str(buf)) = flat[i * 2].kind, let s = String._tryFromUTF8(buf), d[s] == nil {
+                d[s] = i
+            }
+        }
+        index = d
+        return d
+    }
+}
+
 private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContainerProtocol {
     typealias Key = K
 
     private enum Source {
-        case eager([String: MsgPackValue])
+        case eager(EagerMapCursor)
         case lazy(LazyMapCursor)
 
         func value(forStringKey key: String) -> MsgPackValue? {
             switch self {
-            case let .eager(d): return d[key]
+            case let .eager(c): return c.value(forStringKey: key)
             case let .lazy(c): return c.value(forStringKey: key)
             }
         }
 
         func allStringKeys() -> [String] {
             switch self {
-            case let .eager(d): return Array(d.keys)
+            case let .eager(c): return c.allStringKeys()
             case let .lazy(c): return c.allStringKeys()
             }
         }
 
         func contains(stringKey key: String) -> Bool {
             switch self {
-            case let .eager(d): return d[key] != nil
+            case let .eager(c): return c.contains(stringKey: key)
             case let .lazy(c): return c.contains(stringKey: key)
             }
         }
@@ -770,35 +848,12 @@ private struct MsgPackKeyedDecodingContainer<K: CodingKey>: KeyedDecodingContain
     private(set) var codingPath: [CodingKey]
     private var source: Source
 
-    static func asDictionary(value msgPackValue: MsgPackValue, using decoder: _MsgPackDecoder) -> [String: MsgPackValue] {
-        switch msgPackValue.kind {
-        case let .array(flat), let .map(flat):
-            let n = flat.count / 2
-            var result = [String: MsgPackValue]()
-            result.reserveCapacity(n)
-            for i in 0 ..< n {
-                guard let key = try? decoder.unbox(flat[i * 2], as: String.self) else { continue }
-                result[key]._setIfNil(to: flat[i * 2 + 1])
-            }
-            return result
-        default:
-            var result = [String: MsgPackValue]()
-            let a = msgPackValue.asDictionary()
-            result.reserveCapacity(a.count)
-            for (keyvalue, value) in a {
-                guard let key = try? decoder.unbox(keyvalue, as: String.self) else { continue }
-                result[key]._setIfNil(to: value)
-            }
-            return result
-        }
-    }
-
     init(referencing decoder: _MsgPackDecoder, container: MsgPackValue) {
         self.decoder = decoder
         if case let .lazyMap(c) = container.kind {
             source = .lazy(c)
         } else {
-            source = .eager(Self.asDictionary(value: container, using: decoder))
+            source = .eager(EagerMapCursor(container: container))
         }
         codingPath = decoder.codingPath
     }
@@ -1000,12 +1055,5 @@ extension MsgPackDecodingError {
             let context = DecodingError.Context(codingPath: codingPath, debugDescription: "Expected to decode \(type) but it failed")
             return DecodingError.dataCorrupted(context)
         }
-    }
-}
-
-private extension Optional {
-    mutating func _setIfNil(to value: Wrapped) {
-        guard _fastPath(self == nil) else { return }
-        self = value
     }
 }

@@ -1,5 +1,22 @@
 import Foundation
 
+extension MsgPackValue {
+    /// Compares this value (when it is an on-wire string) against a Swift
+    /// key by raw UTF-8 bytes — no `String` is allocated for the wire key.
+    /// Keys are short, so a plain byte loop beats the setup cost of
+    /// `withUTF8` + `memcmp`.
+    func matchesKeyBytes(_ wanted: String) -> Bool {
+        guard case let .literal(.str(buf)) = kind else { return false }
+        var it = wanted.utf8.makeIterator()
+        var i = 0
+        while let b = it.next() {
+            if i >= buf.count || buf[i] != b { return false }
+            i += 1
+        }
+        return i == buf.count
+    }
+}
+
 final class LazyArrayCursor {
     let scanner: MsgPackScanner
     let start: UnsafeRawPointer
@@ -68,22 +85,9 @@ final class LazyMapCursor {
         pairs.append((k, v))
     }
 
-    /// Compares a cached map key against the requested Swift key by raw UTF-8
-    /// bytes — no `String` is allocated for the on-wire key.
-    private func keyMatches(_ key: MsgPackValue, _ wanted: String) -> Bool {
-        guard case let .literal(.str(buf)) = key.kind else { return false }
-        var it = wanted.utf8.makeIterator()
-        var i = 0
-        while let b = it.next() {
-            if i >= buf.count || buf[i] != b { return false }
-            i += 1
-        }
-        return i == buf.count
-    }
-
     func value(forStringKey key: String) -> MsgPackValue? {
         // 1. Already-consumed pairs (byte-compare, no walk, no allocation).
-        for i in 0 ..< consumedPairs where keyMatches(pairs[i].0, key) {
+        for i in 0 ..< consumedPairs where pairs[i].0.matchesKeyBytes(key) {
             return pairs[i].1
         }
         // 2. Walk forward from the sequential cursor until the key is found.
@@ -91,7 +95,7 @@ final class LazyMapCursor {
         while consumedPairs < pairCount {
             consumeNext()
             let pair = pairs[consumedPairs - 1]
-            if keyMatches(pair.0, key) {
+            if pair.0.matchesKeyBytes(key) {
                 return pair.1
             }
         }
