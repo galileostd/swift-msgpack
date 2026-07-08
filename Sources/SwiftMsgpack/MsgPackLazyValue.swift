@@ -58,13 +58,11 @@ final class LazyMapCursor {
         consumedPairs = 0
     }
 
-    /// Consumes the next unvisited pair, caching it. The key is materialised
-    /// without the `.raw` wrapper (it is only ever byte-compared, never
-    /// re-serialised), so no allocation happens for keys.
+    /// Consumes the next unvisited pair, caching it.
     private func consumeNext() {
         let i = consumedPairs
         scanner.seek(to: pairPositions[i])
-        let k = scanner.scanLazyInner()
+        let k = scanner.scanLazy()
         let v = scanner.scanLazy()
         consumedPairs += 1
         pairs.append((k, v))
@@ -73,7 +71,7 @@ final class LazyMapCursor {
     /// Compares a cached map key against the requested Swift key by raw UTF-8
     /// bytes — no `String` is allocated for the on-wire key.
     private func keyMatches(_ key: MsgPackValue, _ wanted: String) -> Bool {
-        guard case let .literal(.str(buf)) = key.stripped else { return false }
+        guard case let .literal(.str(buf)) = key.kind else { return false }
         var it = wanted.utf8.makeIterator()
         var i = 0
         while let b = it.next() {
@@ -120,7 +118,7 @@ final class LazyMapCursor {
         var keys: [String] = []
         keys.reserveCapacity(pairs.count)
         for (k, _) in pairs {
-            if case let .literal(.str(buf)) = k.stripped, let s = String._tryFromUTF8(buf) {
+            if case let .literal(.str(buf)) = k.kind, let s = String._tryFromUTF8(buf) {
                 keys.append(s)
             }
         }

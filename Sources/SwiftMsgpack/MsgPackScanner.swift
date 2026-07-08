@@ -34,39 +34,40 @@ extension MsgPackValueLiteralType {
     }
 }
 
-enum MsgPackValue {
-    case none
-    case literal(MsgPackValueLiteralType)
-    case ext(Int8, Data)
-    case array([MsgPackValue])
-    case map([MsgPackValue])
-    case lazyArray(LazyArrayCursor)
-    case lazyMap(LazyMapCursor)
-    indirect case raw(from: Int, count: Int, MsgPackValue)
+/// A scanned MessagePack value. A struct rather than an indirect enum so the
+/// per-value byte span travels inline with the payload: building the value
+/// tree allocates only the container arrays, never a box per value.
+struct MsgPackValue {
+    enum Kind {
+        case none
+        case literal(MsgPackValueLiteralType)
+        case ext(Int8, Data)
+        case array([MsgPackValue])
+        case map([MsgPackValue])
+        case lazyArray(LazyArrayCursor)
+        case lazyMap(LazyMapCursor)
+    }
+
+    var kind: Kind
+    /// Byte span of this value in the source buffer; `count == 0` means the
+    /// span is unknown (nothing was consumed producing this value).
+    var from: Int = 0
+    var count: Int = 0
+
+    static var none: MsgPackValue { MsgPackValue(kind: .none) }
 }
 
 extension MsgPackValue {
-    var stripped: MsgPackValue {
-        if case let .raw(_, _, inner) = self {
-            return inner.stripped
-        }
-        return self
-    }
-
     func rawData(from source: Data) -> Data? {
-        if case let .raw(from, count, _) = self {
-            let start = source.startIndex + from
-            return source.subdata(in: start ..< (start + count))
-        }
-        return nil
+        guard count > 0 else { return nil }
+        let start = source.startIndex + from
+        return source.subdata(in: start ..< (start + count))
     }
 }
 
 extension MsgPackValue {
     func asArray() -> [MsgPackValue] {
-        switch self {
-        case let .raw(_, _, inner):
-            return inner.asArray()
+        switch kind {
         case .none:
             return []
         case .literal, .ext:
@@ -81,9 +82,7 @@ extension MsgPackValue {
     }
 
     func asDictionary() -> [(MsgPackValue, MsgPackValue)] {
-        switch self {
-        case let .raw(_, _, inner):
-            return inner.asDictionary()
+        switch kind {
         case .none, .literal, .ext:
             return []
         case let .array(a):
@@ -136,9 +135,7 @@ extension MsgPackValue {
 
 extension MsgPackValue {
     var debugDataTypeDescription: String {
-        switch self {
-        case let .raw(_, _, inner):
-            return inner.debugDataTypeDescription
+        switch kind {
         case .none:
             return "none"
         case let .literal(v):
@@ -299,15 +296,12 @@ class MsgPackScanner {
 
     func scan() -> MsgPackValue {
         let begin = start.distance(to: ptr)
-        let inner = scanInner()
+        let kind = scanInner()
         let end = start.distance(to: ptr)
-        if end <= begin {
-            return inner
-        }
-        return .raw(from: begin, count: end - begin, inner)
+        return MsgPackValue(kind: kind, from: begin, count: max(0, end - begin))
     }
 
-    private func scanInner() -> MsgPackValue {
+    private func scanInner() -> MsgPackValue.Kind {
         switch readOpCode() {
         case .end, .neverUsed:
             .none
@@ -330,7 +324,7 @@ class MsgPackScanner {
         }
     }
 
-    private func scanUInt(_ c: UInt8) -> MsgPackValue {
+    private func scanUInt(_ c: UInt8) -> MsgPackValue.Kind {
         .literal(.uint(_scanUInt(c)))
     }
 
@@ -361,7 +355,7 @@ class MsgPackScanner {
         return Int(v)
     }
 
-    private func scanInt(_ c: UInt8) -> MsgPackValue {
+    private func scanInt(_ c: UInt8) -> MsgPackValue.Kind {
         switch c {
         case 0x80:
             .literal(.int(Int64(readInt8())))
@@ -376,21 +370,21 @@ class MsgPackScanner {
         }
     }
 
-    private func scanString(_ c: UInt8) -> MsgPackValue {
+    private func scanString(_ c: UInt8) -> MsgPackValue.Kind {
         .literal(.str(readBuffer(getLength(c))))
     }
 
-    private func scanBinary(_ c: UInt8) -> MsgPackValue {
+    private func scanBinary(_ c: UInt8) -> MsgPackValue.Kind {
         .literal(.bin(.init(buffer: readBuffer(getLength(c)))))
     }
 
-    private func scanExtension(_ c: UInt8) -> MsgPackValue {
+    private func scanExtension(_ c: UInt8) -> MsgPackValue.Kind {
         let n = getLength(c)
         let typeNo = Int8(bitPattern: readUInt8())
         return .ext(typeNo, .init(buffer: readBuffer(n)))
     }
 
-    private func scanSimple(_ c: UInt8) -> MsgPackValue {
+    private func scanSimple(_ c: UInt8) -> MsgPackValue.Kind {
         switch c {
         case 0xC0:
             .literal(.nil)
@@ -416,7 +410,7 @@ class MsgPackScanner {
         return true
     }
 
-    private func scanArray(_ c: UInt8) -> MsgPackValue {
+    private func scanArray(_ c: UInt8) -> MsgPackValue.Kind {
         let n = getLength(c)
         guard !corrupt, enterNesting() else { return .none }
         defer { depth -= 1 }
@@ -429,7 +423,7 @@ class MsgPackScanner {
         return .array(a)
     }
 
-    private func scanMap(_ c: UInt8) -> MsgPackValue {
+    private func scanMap(_ c: UInt8) -> MsgPackValue.Kind {
         let n = getLength(c)
         guard !corrupt, enterNesting() else { return .none }
         defer { depth -= 1 }
@@ -457,15 +451,12 @@ extension MsgPackScanner {
 
     func scanLazy() -> MsgPackValue {
         let begin = start.distance(to: ptr)
-        let inner = scanLazyInner()
+        let kind = scanLazyInner()
         let end = start.distance(to: ptr)
-        if end <= begin {
-            return inner
-        }
-        return .raw(from: begin, count: end - begin, inner)
+        return MsgPackValue(kind: kind, from: begin, count: max(0, end - begin))
     }
 
-    func scanLazyInner() -> MsgPackValue {
+    private func scanLazyInner() -> MsgPackValue.Kind {
         switch readOpCode() {
         case .end, .neverUsed:
             return .none

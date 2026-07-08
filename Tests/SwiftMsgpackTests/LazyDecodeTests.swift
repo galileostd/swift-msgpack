@@ -237,7 +237,7 @@ final class LazyDecodeTests: XCTestCase {
 
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let scanner = MsgPackScanner(ptr: raw.baseAddress!, count: raw.count)
-            guard case let .lazyMap(cursor) = scanner.scanLazy().stripped else {
+            guard case let .lazyMap(cursor) = scanner.scanLazy().kind else {
                 XCTFail("expected .lazyMap at root")
                 return
             }
@@ -267,7 +267,7 @@ final class LazyDecodeTests: XCTestCase {
 
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let scanner = MsgPackScanner(ptr: raw.baseAddress!, count: raw.count)
-            guard case let .lazyArray(cursor) = scanner.scanLazy().stripped else {
+            guard case let .lazyArray(cursor) = scanner.scanLazy().kind else {
                 XCTFail("expected .lazyArray at root")
                 return
             }
